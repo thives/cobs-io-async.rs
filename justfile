@@ -13,20 +13,27 @@ embedded:
   cargo build --target thumbv7em-none-eabihf --no-default-features
 
 test:
+  cargo nextest r --features embedded-io
+  cargo nextest r --features tokio
   cargo nextest r --all-features
+  cargo test --doc --features embedded-io
+  cargo test --doc --features tokio
   cargo test --doc
 
 build:
   cargo build --all-features
 
 docs:
-  RUSTDOCFLAGS="--cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --all-features
+  RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --features embedded-io
+  RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --features tokio
+  RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --all-features
 
 docs-html:
-  RUSTDOCFLAGS="--cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --all-features --open
+  RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --all-features --open
 
 coverage:
-  cargo llvm-cov nextest
+  cargo llvm-cov --all-features nextest --lcov --output-path target/llvm-cov/lcov.info
+  cargo llvm-cov --all-features report
 
 coverage-html:
-  cargo llvm-cov nextest --html --open
+  cargo llvm-cov --all-features nextest --html --open

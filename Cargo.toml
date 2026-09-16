@@ -1,39 +1,34 @@
 [package]
-name = "cobs"
-version = "0.5.1"
+name = "cobs-io-async"
+version = "0.0.1"
 authors = [
-  "Allen Welkie <>",
-  "James Munns <james@onevariable.com>",
-  "Robin Mueller <robin.mueller.m@gmail.com>"
+  "Thomas Ivesdal-Tronstad <>",
 ]
 license = "MIT OR Apache-2.0"
-description = """
-    This is an implementation of the Consistent Overhead Byte Stuffing (COBS) algorithm.
-    COBS is an algorithm for transforming a message into an encoding where a specific value
-    (the "sentinel" value) is not used. This value can then be used to mark frame boundaries
-    in a serial communication channel. """
-repository = "https://github.com/jamesmunns/cobs.rs"
-keywords = ["consistent", "overhead", "byte", "stuffing", "encoding"]
+description = "Asynchronous COBS encoding and decoding for embedded-io-async and Tokio, with no_std support and incremental framing."
+repository = "https://github.com/thives/cobs-io-async.rs"
+keywords = ["consistent", "overhead", "byte", "stuffing", "io", "encoding", "async"]
 edition = "2024"
 rust-version = "1.87"
 
 [features]
-default = ["std"]
-std = ["alloc", "thiserror/std"]
-alloc = []
-# Legacy feature for backwards compatibility
-use_std = ["std"]
+default = ["tokio", "serde"]
+embedded-io = ["dep:embedded-io-async"]
+std = ["embedded-io-async?/std"]
+tokio = ["std","dep:tokio"]
+serde = ["dep:serde"]
+defmt = ["dep:defmt", "embedded-io-async?/defmt"]
 
 [dependencies]
-thiserror = { version = "2", default-features = false }
 defmt = { version = "1", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
-heapless = "0.9"
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+embedded-io-async = { version = "0.7", default-features = false, optional = true }
+tokio = { version = "1.53", default-features = false, features = ["io-util"], optional = true }
 
 [dev-dependencies]
-quickcheck = "1"
 criterion = { version = "0.8" }
 rand = "0.10"
+futures = "0.3"
 
 [[bench]]
 name = "main"
