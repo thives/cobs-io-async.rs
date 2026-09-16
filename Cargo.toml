@@ -7,7 +7,7 @@ authors = [
 license = "MIT OR Apache-2.0"
 description = "Asynchronous COBS encoding and decoding for embedded-io-async and Tokio, with no_std support and incremental framing."
 repository = "https://github.com/thives/cobs-io-async.rs"
-keywords = ["consistent", "overhead", "byte", "stuffing", "io", "encoding", "async"]
+keywords = ["cobs", "codec", "io", "encoding", "async"]
 edition = "2024"
 rust-version = "1.87"
 
