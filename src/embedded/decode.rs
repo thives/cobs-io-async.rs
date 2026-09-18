@@ -7,6 +7,8 @@ define_decoder! {
     D: [Write],
     S: [Read + ?Sized],
     errors: [S::Error, D::Error],
+    slice_source_error: SeekableError,
+    slice_dest_error: SeekableError,
 }
 
 /// Decodes one COBS frame into the beginning of `dest`.
@@ -140,6 +142,23 @@ where
     }
 
     async fn flush(&mut self) -> Result<(), DecodeError<SeekableError, D::Error>> {
+        Ok(())
+    }
+}
+
+impl ErrorType for CobsDecoderSliceAsync<'_> {
+    type Error = DecodeError<SeekableError, SeekableError>;
+}
+
+impl Write for CobsDecoderSliceAsync<'_> {
+    async fn write(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<usize, DecodeError<SeekableError, SeekableError>> {
+        self.0.write(buf).await
+    }
+
+    async fn flush(&mut self) -> Result<(), DecodeError<SeekableError, SeekableError>> {
         Ok(())
     }
 }

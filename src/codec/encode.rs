@@ -295,9 +295,10 @@ macro_rules! define_encoder {
         dest_nonseek: [$($writer_nonseek_bounds:tt)+],
         errors: [$source_error:ty, $dest_error:ty],
         slice_source_error: $slice_source_error:ty,
+        slice_dest_error: $slice_dest_error:ty,
         seek_from: $seek_from:path $(,)?
     ) => {
-        use $crate::codec::encode::{EncoderCore, Phase, PushResult, Following, Block, InputSeekable};
+        use $crate::codec::{encode::{EncoderCore, Phase, PushResult, Following, Block, InputSeekable}, OutputSeekable};
         use $crate::EncodeError;
         use ::core::convert::Infallible;
         use core::marker::PhantomData;
@@ -504,7 +505,8 @@ macro_rules! define_encoder {
             async fn push_byte<E>(
                 &mut self,
                 byte: u8,
-            ) -> Result<(), EncodeError<E, $dest_error>> {
+            ) -> Result<usize, EncodeError<E, $dest_error>> {
+                let mut written = 0;
                 if self.core.needs_code_placeholder {
                     self.append::<E>(0).await?;
                     self.core.needs_code_placeholder = false;
@@ -515,10 +517,12 @@ macro_rules! define_encoder {
                 match action {
                     PushResult::AddSingle(byte) => {
                         self.append::<E>(byte).await?;
+                        written += 1;
                     }
                     PushResult::ModifyFromStartAndSkip((idx, code)) => {
                         self.write_at::<E>(idx, code).await?;
                         self.append::<E>(0).await?;
+                        written += 2;
                     }
                     PushResult::ModifyFromStartAndPushAndSkip(
                         (idx, code, byte),
@@ -526,9 +530,10 @@ macro_rules! define_encoder {
                         self.write_at::<E>(idx, code).await?;
                         self.append::<E>(byte).await?;
                         self.core.needs_code_placeholder = true;
+                        written += 2;
                     }
                 }
-                Ok(())
+                Ok(written)
             }
 
             /// Appends payload read from `source` to the current COBS body.
@@ -578,12 +583,13 @@ macro_rules! define_encoder {
             pub async fn push_async<$S>(
                 &mut self,
                 source: &mut $S,
-            ) -> Result<(), EncodeError<$source_error, $dest_error>>
+            ) -> Result<usize, EncodeError<$source_error, $dest_error>>
             where
                 $S: $($reader_bounds)+,
             {
                 self.begin_push::<$source_error>().await?;
                 let mut byte = [0u8; 1];
+                let mut written = 0;
                 loop {
                     let n = source
                         .read(&mut byte)
@@ -592,10 +598,10 @@ macro_rules! define_encoder {
                     if n == 0 {
                         break;
                     }
-                    self.push_byte::<$source_error>(byte[0]).await?;
+                    written += self.push_byte::<$source_error>(byte[0]).await?;
                 }
                 self.core.phase = Phase::Ready;
-                Ok(())
+                Ok(written)
             }
 
             /// Appends every byte of `source` to the current COBS body.
@@ -631,15 +637,16 @@ macro_rules! define_encoder {
                 &mut self,
                 source: &[u8],
             ) -> Result<
-                (),
-                EncodeError<$crate::SeekableError, $dest_error>,
+                usize,
+                EncodeError<$slice_source_error, $dest_error>,
             > {
-                self.begin_push::<$crate::SeekableError>().await?;
+                let mut written = 0;
+                self.begin_push::<$slice_source_error>().await?;
                 for &byte in source {
-                    self.push_byte::<$crate::SeekableError>(byte).await?;
+                    written += self.push_byte::<$slice_source_error>(byte).await?;
                 }
                 self.core.phase = Phase::Ready;
-                Ok(())
+                Ok(written)
             }
 
             /// Completes the current undelimited COBS body.
@@ -765,6 +772,83 @@ macro_rules! define_encoder {
                 self.write_at::<Infallible>(self.core.dest_idx, 0).await?;
                 self.core.complete_reset(next_start);
                 Ok(())
+            }
+        }
+
+        /// A wrapper for CobsEncoderAsync that encodes into a mutable slice.
+        ///
+        /// This is a special case of CobsEncoderAsync that contains additional internal state
+        /// to progressively encode into a mutable slice.
+        /// This encode process requires seeking in the destination. This type handles that
+        /// state internally.
+        #[derive(Debug)]
+        pub struct CobsEncoderSliceAsync<'a>(CobsEncoderAsync<OutputSeekable<'a>>);
+
+        impl<'a> CobsEncoderAsync<OutputSeekable<'a>> {
+            /// Creates an idle encoder.
+            ///
+            /// Returns a wrapper for CobsEncoderAsync that encodes into the provided mutable
+            /// slice. The slice is not modified until the encoder writes to it. The slice is
+            /// not required to be empty, and its contents are not validated or cleared.
+            pub fn new_to_slice(dest: &'a mut [u8]) -> CobsEncoderSliceAsync<'a> {
+                CobsEncoderSliceAsync(CobsEncoderAsync::new(OutputSeekable::new(dest)))
+            }
+        }
+
+        impl<'a> CobsEncoderSliceAsync<'a>
+        {
+            /// Wrapper for CobsEncoderAsync::push_async that encodes into the provided mutable slice.
+            pub async fn push_async<$S>(
+                &mut self,
+                source: &mut $S,
+            ) -> Result<usize, EncodeError<$source_error, $slice_dest_error>>
+            where
+                $S: $($reader_bounds)+,
+            {
+                self.0.push_async(source).await
+            }
+
+            /// Wrapper for CobsEncoderAsync::push_slice_async that encodes a slice into the
+            /// provided mutable slice.
+            pub async fn push_slice_async(
+                &mut self,
+                source: &[u8],
+            ) -> Result<usize, EncodeError<$slice_source_error, $slice_dest_error>>
+            {
+                self.0.push_slice_async(source).await
+            }
+
+            /// Wrapper for CobsEncoderAsync::finalize_async.
+            pub async fn finalize_async(
+                &mut self,
+            ) -> Result<u64, EncodeError<Infallible, $slice_dest_error>>
+            {
+                self.0.finalize_async().await
+            }
+
+            /// Wrapper for CobsEncoderAsync::reset_async.
+            pub async fn reset_async(
+                &mut self,
+            ) -> Result<(), EncodeError<Infallible, $slice_dest_error>>
+            {
+                self.0.reset_async().await
+            }
+
+            /// Wrapper for CobsEncoderAsync::dest.
+            pub fn dest(&'a self) -> &'a [u8] {
+                &self.0.dest().buf
+            }
+
+            /// Wrapper for CobsEncoderAsync::dest_mut.
+            pub fn dest_mut(&'a mut self) -> &'a mut [u8]
+            {
+                &mut self.0.dest_mut().buf
+            }
+
+            /// Wrapper for CobsEncoderAsync::into_inner.
+            pub fn into_inner(self) -> &'a mut [u8]
+            {
+                self.0.into_inner().buf
             }
         }
 

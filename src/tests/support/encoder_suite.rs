@@ -137,6 +137,19 @@ macro_rules! encoder_tests {
         }
 
         #[test]
+        fn owned_writer_and_accessors_preserve_destination_to_slice() {
+            block_on(async {
+                let mut slice = [0x80; 16];
+                let mut encoder = api::CobsEncoderAsync::new_to_slice(&mut slice);
+                encoder.push_slice_async(b"A").await.unwrap();
+                let n = encoder.finalize_async().await.unwrap() as usize;
+                assert_eq!(n, 2);
+                let slice = encoder.into_inner();
+                assert_eq!(&slice[..n], &[2, b'A']);
+            });
+        }
+
+        #[test]
         fn empty_finalization_is_idempotent_and_rejects_pushes() {
             block_on(async {
                 let mut encoder = api::CobsEncoderAsync::new(TestWriter::new(16));
@@ -289,6 +302,48 @@ macro_rules! encoder_tests {
         }
 
         #[test]
+        fn zero_after_full_block_is_independent_of_chunk_boundaries_slice_dest() {
+            let mut input = [1; 255];
+            input[254] = 0;
+            let mut expected = [1; 257];
+            expected[0] = 0xFF;
+            check_vector("full_block_then_zero", &input, &expected);
+            block_on(async {
+                for reader_input in [false, true] {
+                    for split in 0..=input.len() {
+                        let mut slice = [0x80; 265];
+                        let mut encoder = api::CobsEncoderAsync::new_to_slice(&mut slice);
+                        let mut encoded_len = 0;
+                        for chunk in [&input[..split], &[], &input[split..]] {
+                            if reader_input {
+                                let mut reader = chunk;
+                                encoded_len += encoder.push_async(&mut reader).await.unwrap();
+                                assert!(reader.is_empty());
+                            } else {
+                                encoded_len += encoder.push_slice_async(chunk).await.unwrap();
+                            }
+                        }
+                        assert_eq!(
+                            encoder.finalize_async().await.unwrap(),
+                            expected.len() as u64,
+                            "split={split}, reader_input={reader_input}",
+                        );
+                        assert_eq!(
+                            &encoder.dest()[..encoded_len],
+                            expected.as_slice(),
+                            "split={split}, reader_input={reader_input}",
+                        );
+                        assert!(
+                            encoder.dest()[expected.len()..]
+                                .iter()
+                                .all(|&byte| byte == 0x80)
+                        );
+                    }
+                }
+            });
+        }
+
+        #[test]
         fn chunked_encoding_matches_one_shot_for_varying_lengths() {
             block_on(async {
                 let source: [u8; 1000] = core::array::from_fn(|index| (index & 0xFF) as u8);
@@ -411,6 +466,70 @@ macro_rules! encoder_tests {
                 assert_eq!(encoder.dest().position(), 2);
                 assert_eq!(encoder.finalize_async().await.unwrap(), 1);
                 assert_eq!(encoder.dest().bytes(), &[0, 0, 1]);
+            });
+        }
+
+        #[test]
+        fn reset_from_new_and_repeated_reset_create_boundaries_to_slice() {
+            block_on(async {
+                let mut slice = [0x80; 16];
+                let mut encoder = api::CobsEncoderAsync::new_to_slice(&mut slice);
+                encoder.reset_async().await.unwrap();
+                encoder.reset_async().await.unwrap();
+                assert_eq!(&encoder.dest()[..2], &mut [0, 0]);
+            });
+        }
+
+        #[test]
+        fn dest_returns_correctly() {
+            block_on(async {
+                let mut output_buffer = TestWriter::new(32);
+                let expected = core::ptr::from_ref(&output_buffer);
+                let encoder = api::CobsEncoderAsync::new(&mut output_buffer);
+                assert_eq!(expected, core::ptr::from_ref(&**encoder.dest()));
+            });
+        }
+
+        #[test]
+        fn dest_mut_returns_correctly() {
+            block_on(async {
+                let mut output_buffer = TestWriter::new(32);
+                let expected = core::ptr::from_mut(&mut output_buffer);
+                let mut encoder = api::CobsEncoderAsync::new(&mut output_buffer);
+                assert_eq!(expected, core::ptr::from_mut(&mut **encoder.dest_mut()));
+            });
+        }
+
+        #[test]
+        fn dest_returns_correctly_to_slice() {
+            block_on(async {
+                let mut slice = [0x80; 32];
+                let expected = core::ptr::from_ref(slice.as_slice());
+                let encoder = api::CobsEncoderAsync::new_to_slice(&mut slice);
+                assert_eq!(expected, core::ptr::from_ref(encoder.dest()));
+            });
+        }
+
+        #[test]
+        fn dest_mut_returns_correctly_to_slice() {
+            block_on(async {
+                let mut slice = [0x80; 32];
+                let expected = core::ptr::from_mut(slice.as_mut_slice());
+                let mut encoder = api::CobsEncoderAsync::new_to_slice(&mut slice);
+                assert_eq!(expected, core::ptr::from_mut(encoder.dest_mut()));
+            });
+        }
+
+        #[test]
+        fn overflow_into_dest_errors_no_panic() {
+            block_on(async {
+                let mut slice = [0x80; 32];
+                let input = [0xFF; 64];
+                let mut encoder = api::CobsEncoderAsync::new_to_slice(&mut slice);
+                assert!(matches!(
+                    encoder.push_slice_async(&input).await,
+                    Err(EncodeError::Destination(_))
+                ));
             });
         }
     };

@@ -8,6 +8,8 @@ define_decoder! {
     D: [AsyncWrite + Unpin],
     S: [AsyncRead + Unpin + ?Sized],
     errors: [io::Error, io::Error],
+    slice_source_error: io::Error,
+    slice_dest_error: io::Error,
 }
 
 /// Decodes one COBS frame into the beginning of `dest`.

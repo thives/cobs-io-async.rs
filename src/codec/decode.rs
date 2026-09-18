@@ -265,8 +265,10 @@ macro_rules! define_decoder {
         $D:ident: [$($writer_bounds:tt)+],
         $S:ident: [$($reader_bounds:tt)+],
         errors: [$source_error:ty, $dest_error:ty],
+        slice_source_error: $slice_source_error:ty,
+        slice_dest_error: $slice_dest_error:ty,
     ) => {
-        use $crate::codec::decode::{DecodeAction, DecoderCore};
+        use $crate::codec::{decode::{DecodeAction, DecoderCore}, OutputSeekable};
         use $crate::{DecodeError, DecodeProgress};
 
         /// Incrementally decodes zero-delimited COBS frames into an asynchronous writer.
@@ -667,14 +669,14 @@ macro_rules! define_decoder {
             pub async fn push_slice_async(
                 &mut self,
                 source: &[u8],
-            ) -> Result<DecodeProgress, DecodeError<$crate::SeekableError, $dest_error>> {
+            ) -> Result<DecodeProgress, DecodeError<$slice_source_error, $dest_error>> {
                 if !self.core.begin_push() {
                     return Err(DecodeError::Poisoned);
                 }
                 let mut progress = DecodeProgress::default();
                 for &byte in source {
                     if self
-                        .process_byte::<$crate::SeekableError>(byte, &mut progress)
+                        .process_byte::<$slice_source_error>(byte, &mut progress)
                         .await?
                     {
                         return Ok(progress);
@@ -711,6 +713,87 @@ macro_rules! define_decoder {
                     }
                 }
                 Ok(false)
+            }
+        }
+
+        /// A wrapper for CobsDecoderAsync that decodes into a mutable slice.
+        ///
+        /// This is a special case of CobsDecoderAsync that contains additional internal state
+        /// to progressively decode into a mutable slice.
+        /// It provides a convenient interface for decoding into a slice without requiring
+        /// the user to manage the current output position manually.
+        #[derive(Debug)]
+        pub struct CobsDecoderSliceAsync<'a>(CobsDecoderAsync<OutputSeekable<'a>>);
+
+        impl<'a> CobsDecoderAsync<&'a [u8]> {
+            /// Creates an idle decoder.
+            ///
+            /// Returns a wrapper for CobsDecoderAsync that decodes into the provided mutable slice.
+            /// The slice is not modified until the decoder writes to it. The slice is not required
+            /// to be empty, and its contents are not validated or cleared.
+            pub fn new_to_slice(dest: &'a mut [u8]) -> CobsDecoderSliceAsync<'a> {
+                CobsDecoderSliceAsync(CobsDecoderAsync::new(OutputSeekable::new(dest)))
+            }
+        }
+
+        impl<'a> CobsDecoderSliceAsync<'a>
+        {
+            /// Wrapper for CobsDecoderAsync::push_async that decodes into the provided mutable slice.
+            pub async fn push_async<$S>(
+                &mut self,
+                source: &mut $S,
+            ) -> Result<DecodeProgress, DecodeError<$source_error, $slice_source_error>>
+            where
+                $S: $($reader_bounds)+,
+        {
+            self.0.push_async(source).await
+        }
+
+            /// Wrapper for CobsDecoderAsync::push_slice_async that decodes a slice into the provided
+            /// mutable slice.
+            pub async fn push_slice_async(
+                &mut self,
+                source: &[u8],
+            ) -> Result<DecodeProgress, DecodeError<$slice_source_error, $slice_source_error>>
+            {
+                self.0.push_slice_async(source).await
+            }
+
+            /// Wrapper for CobsDecoderAsync::dest.
+            pub fn dest(&'a self) -> &'a [u8] {
+                self.0.dest().buf
+            }
+
+            /// Wrapper for CobsDecoderAsync::dest_mut.
+            pub fn dest_mut(&'a mut self) -> &'a mut [u8] {
+                self.0.dest_mut().buf
+            }
+
+            /// Wrapper for CobsDecoderAsync::into_inner.
+            pub fn into_inner(self) -> &'a mut [u8] {
+                self.0.into_inner().buf
+            }
+
+            /// Wrapper for CobsDecoderAsync::check_complete.
+            pub fn check_complete(&self) -> Result<(), $crate::CompletionError> {
+                self.0.core.check_complete()
+            }
+
+            /// Wrapper for CobsDecoderAsync::finish_frame.
+            pub fn finish_frame(&mut self) -> Result<u64, $crate::CompletionError>
+            {
+                self.0.core.finish_frame()
+            }
+
+            /// Wrapper for CobsDecoderAsync::discard_frame_async.
+            pub async fn discard_frame_async<$S>(
+                &mut self,
+                source: &mut $S,
+            ) -> Result<u64, DecodeError<$source_error, ::core::convert::Infallible>>
+            where
+                $S: $($reader_bounds)+,
+            {
+                self.0.discard_frame_async(source).await
             }
         }
 

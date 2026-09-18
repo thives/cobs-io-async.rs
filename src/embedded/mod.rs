@@ -89,11 +89,12 @@ mod decode;
 mod encode;
 
 #[doc(inline)]
-pub use decode::{CobsDecoderAsync, decode_to_slice_async};
+pub use decode::{CobsDecoderAsync, CobsDecoderSliceAsync, decode_to_slice_async};
 
 pub use embedded_io_async::Write;
 
 #[doc(inline)]
 pub use encode::{
-    CobsEncoderAsync, encode_from_slice_async, encode_from_slice_including_sentinels_async,
+    CobsEncoderAsync, CobsEncoderSliceAsync, encode_from_slice_async,
+    encode_from_slice_including_sentinels_async,
 };
