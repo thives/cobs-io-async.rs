@@ -100,8 +100,7 @@ macro_rules! decoder_tests {
         #[test]
         fn chunk_exhaustion_preserves_frame_to_slice() {
             block_on(async {
-                let mut slice = [0x80; 8];
-                let mut decoder = api::CobsDecoderAsync::new_to_slice(&mut slice);
+                let mut decoder = api::CobsDecoderAsync::new_to_slice([0x80; 8]);
                 assert_eq!(
                     decoder.push_slice_async(&[2, 7]).await.unwrap(),
                     DecodeProgress {
@@ -209,8 +208,7 @@ macro_rules! decoder_tests {
         #[test]
         fn stops_at_first_frame_boundary_to_slice() {
             block_on(async {
-                let mut slice = [0x80; 8];
-                let mut decoder = api::CobsDecoderAsync::new_to_slice(&mut slice);
+                let mut decoder = api::CobsDecoderAsync::new_to_slice([0x80; 8]);
                 let encoded = [0, 0, 1, 0, 2, 7, 0, 2, 8, 0];
                 let mut source = encoded.as_slice();
                 for (consumed, written, remaining) in [
@@ -500,8 +498,7 @@ macro_rules! decoder_tests {
         #[test]
         fn failed_discard_preserves_count_until_successful_retry_to_slice() {
             block_on(async {
-                let mut slice = [0x80; 8];
-                let mut decoder = api::CobsDecoderAsync::new_to_slice(&mut slice);
+                let mut decoder = api::CobsDecoderAsync::new_to_slice([0x80; 8]);
                 let _ = decoder.push_slice_async(&[4, 7]).await.unwrap();
                 let mut incomplete: &[u8] = &[8, 9];
                 assert!(matches!(
@@ -656,30 +653,30 @@ macro_rules! decoder_tests {
         #[test]
         fn dest_returns_correctly_to_slice() {
             block_on(async {
-                let mut slice = [0x80; 32];
-                let expected = core::ptr::from_ref(slice.as_slice());
-                let decoder = api::CobsDecoderAsync::new_to_slice(&mut slice);
-                assert_eq!(expected, core::ptr::from_ref(decoder.dest()));
+                let slice = [0x80; 32];
+                let expected = slice.clone();
+                let decoder = api::CobsDecoderAsync::new_to_slice(slice);
+                assert_eq!(expected, *decoder.dest());
             });
         }
 
         #[test]
         fn dest_mut_returns_correctly_to_slice() {
             block_on(async {
-                let mut slice = [0x80; 32];
-                let expected = core::ptr::from_mut(slice.as_mut_slice());
-                let mut decoder = api::CobsDecoderAsync::new_to_slice(&mut slice);
-                assert_eq!(expected, core::ptr::from_mut(decoder.dest_mut()));
+                let slice = [0x80; 32];
+                let expected = slice.clone();
+                let mut decoder = api::CobsDecoderAsync::new_to_slice(slice);
+                assert_eq!(expected, *decoder.dest_mut());
             });
         }
 
         #[test]
         fn into_inner_returns_correctly_to_slice() {
             block_on(async {
-                let mut slice = [0x80; 32];
-                let expected = core::ptr::from_mut(slice.as_mut_slice());
-                let decoder = api::CobsDecoderAsync::new_to_slice(&mut slice);
-                assert_eq!(expected, core::ptr::from_mut(&mut *decoder.into_inner()));
+                let slice = [0x80; 32];
+                let expected = slice.clone();
+                let decoder = api::CobsDecoderAsync::new_to_slice(slice);
+                assert_eq!(expected, decoder.into_inner());
             });
         }
 

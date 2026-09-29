@@ -91,10 +91,72 @@ mod encode;
 #[doc(inline)]
 pub use decode::{CobsDecoderAsync, CobsDecoderSliceAsync, decode_to_slice_async};
 
-pub use embedded_io_async::Write;
+pub use embedded_io_async::{ErrorType, Read, Seek, Write};
 
 #[doc(inline)]
 pub use encode::{
     CobsEncoderAsync, CobsEncoderSliceAsync, encode_from_slice_async,
     encode_from_slice_including_sentinels_async,
 };
+
+use crate::codec::DEFAULT_BUF_SIZE;
+use crate::{DecodeError, EncodeError, SeekableError, CodecError};
+
+/// COBS codec wrapper around an `embedded-io` stream.
+///
+/// Implements [`Read`] and [`Write`] when `S` does. Reads return decoded
+/// frame payloads, and writes encode `buf` as a single zero-delimited frame.
+pub struct CobsAsync<S> {
+    stream: S,
+    decoder: CobsDecoderSliceAsync<DEFAULT_BUF_SIZE>,
+}
+
+impl<S> CobsAsync<S> {
+    /// Creates a codec wrapper around `stream`.
+    pub fn new(stream: S) -> Self {
+        Self {
+            stream,
+            decoder: CobsDecoderAsync::new_to_slice([0u8; DEFAULT_BUF_SIZE]),
+        }
+    }
+}
+
+impl<S> ErrorType for CobsAsync<S>
+where
+    S: Read + Write,
+{
+    type Error = CodecError<DecodeError<S::Error, SeekableError>, EncodeError<SeekableError, S::Error>>;
+}
+
+impl<S> Read for CobsAsync<S>
+where
+    S: Read + Write,
+{
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        loop {
+            match self.decoder.push_async(&mut self.stream).await {
+                Ok(progress) => {
+                    if let Some(frame_len) = progress.frame_len.map(|s| s as usize) {
+                        buf[..frame_len].copy_from_slice(&self.decoder.dest()[..frame_len]);
+                        return Ok(frame_len);
+                    }
+                }
+                Err(e) => return Err(CodecError::Decode(e)),
+            }
+        }
+    }
+}
+
+impl<S> Write for CobsAsync<S>
+where
+    S: Read + Write,
+{
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        let n = encode_from_slice_including_sentinels_async(buf, &mut self.stream).await.map_err(CodecError::Encode)?;
+        Ok(n as usize)
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}

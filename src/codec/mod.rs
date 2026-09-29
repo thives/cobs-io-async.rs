@@ -3,25 +3,28 @@ pub(crate) mod encode;
 
 use crate::error::SeekableError;
 
+/// Default internal buffer size in bytes used by the backend codec wrappers.
+pub const DEFAULT_BUF_SIZE: usize = 256;
+
 #[derive(Debug)]
-pub(crate) struct OutputSeekable<'a> {
-    pub(crate) buf: &'a mut [u8],
+pub struct OutputSeekable<const N: usize> {
+    pub(crate) buf: [u8; N],
     idx: usize,
 }
 
-impl<'a> OutputSeekable<'a> {
-    pub(crate) fn new(buf: &'a mut [u8]) -> Self {
+impl<const N: usize> OutputSeekable<N> {
+    pub(crate) fn new(buf: [u8; N]) -> Self {
         Self { buf, idx: 0 }
     }
 }
 
 #[cfg(feature = "embedded-io")]
-impl embedded_io_async::ErrorType for OutputSeekable<'_> {
+impl<const N: usize> embedded_io_async::ErrorType for OutputSeekable<N> {
     type Error = SeekableError;
 }
 
 #[cfg(feature = "embedded-io")]
-impl embedded_io_async::Write for OutputSeekable<'_> {
+impl<const N: usize> embedded_io_async::Write for OutputSeekable<N> {
     async fn write(&mut self, data: &[u8]) -> Result<usize, SeekableError> {
         if data.len() > self.buf.len() - self.idx {
             return Err(SeekableError::OutOfBounds);
@@ -38,7 +41,7 @@ impl embedded_io_async::Write for OutputSeekable<'_> {
 }
 
 #[cfg(feature = "tokio")]
-impl ::tokio::io::AsyncWrite for OutputSeekable<'_> {
+impl<const N: usize> ::tokio::io::AsyncWrite for OutputSeekable<N> {
     fn poll_write(
         self: core::pin::Pin<&mut Self>,
         _cx: &mut core::task::Context<'_>,
@@ -73,7 +76,7 @@ impl ::tokio::io::AsyncWrite for OutputSeekable<'_> {
 }
 
 #[cfg(feature = "embedded-io")]
-impl embedded_io_async::Seek for OutputSeekable<'_> {
+impl<const N: usize> embedded_io_async::Seek for OutputSeekable<N> {
     async fn seek(&mut self, pos: embedded_io_async::SeekFrom) -> Result<u64, SeekableError> {
         match pos {
             embedded_io_async::SeekFrom::Start(offset) => {
@@ -102,7 +105,7 @@ impl embedded_io_async::Seek for OutputSeekable<'_> {
 }
 
 #[cfg(feature = "tokio")]
-impl ::tokio::io::AsyncSeek for OutputSeekable<'_> {
+impl<const N: usize> ::tokio::io::AsyncSeek for OutputSeekable<N> {
     fn start_seek(self: core::pin::Pin<&mut Self>, pos: std::io::SeekFrom) -> std::io::Result<()> {
         let this = self.get_mut();
         match pos {

@@ -350,3 +350,60 @@ impl<D> From<EncodeError<Infallible, D>> for EncodeError<SeekableError, D> {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// An error from a COBS codec operation, tagging which stage failed.
+///
+/// The type parameters preserve the backend error types from the
+/// underlying decode or encode operation.
+pub enum CodecError<DecodeError, EncodeError>
+{
+    /// The error came from the decode path.
+    Decode(DecodeError),
+    /// The error came from the encode path.
+    Encode(EncodeError),
+}
+
+impl<D: core::error::Error, E: core::error::Error> core::error::Error for CodecError<D, E> {}
+
+#[cfg(feature = "embedded-io")]
+impl<D, E> embedded_io_async::Error for CodecError<D, E>
+where
+    D: embedded_io_async::Error,
+    E: embedded_io_async::Error,
+{
+    fn kind(&self) -> embedded_io_async::ErrorKind {
+        match self {
+            CodecError::Decode(e) => e.kind(),
+            CodecError::Encode(e) => e.kind(),
+        }
+    }
+}
+
+impl<D, E> core::fmt::Display for CodecError<D, E>
+where
+    D: core::error::Error,
+    E: core::error::Error,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CodecError::Decode(e) => write!(f, "Decoder error: {}", e),
+            CodecError::Encode(e) => write!(f, "Encoder error: {}", e),
+        }
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl<D, E> defmt::Format for CodecError<D, E>
+where
+    D: defmt::Format,
+    E: defmt::Format,
+{
+    fn format(&self, f: defmt::Formatter<'_>) {
+        match self {
+            CodecError::Decode(e) => defmt::write!(f, "Decoder error: {}", e),
+            CodecError::Encode(e) => defmt::write!(f, "Encoder error: {}", e),
+        }
+    }
+}

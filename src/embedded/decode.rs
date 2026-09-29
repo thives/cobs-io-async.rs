@@ -146,11 +146,11 @@ where
     }
 }
 
-impl ErrorType for CobsDecoderSliceAsync<'_> {
+impl<const N: usize> ErrorType for CobsDecoderSliceAsync<N> {
     type Error = DecodeError<SeekableError, SeekableError>;
 }
 
-impl Write for CobsDecoderSliceAsync<'_> {
+impl<const N: usize> Write for CobsDecoderSliceAsync<N> {
     async fn write(
         &mut self,
         buf: &[u8],

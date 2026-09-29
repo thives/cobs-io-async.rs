@@ -46,11 +46,11 @@ impl<D> CobsEncoderAsync<D> {
     }
 }
 
-impl ErrorType for CobsEncoderSliceAsync<'_> {
+impl<const N: usize> ErrorType for CobsEncoderSliceAsync<N> {
     type Error = EncodeError<SeekableError, SeekableError>;
 }
 
-impl Write for CobsEncoderSliceAsync<'_> {
+impl<const N: usize> Write for CobsEncoderSliceAsync<N> {
     async fn write(
         &mut self,
         buf: &[u8],

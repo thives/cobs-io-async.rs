@@ -782,20 +782,20 @@ macro_rules! define_encoder {
         /// This encode process requires seeking in the destination. This type handles that
         /// state internally.
         #[derive(Debug)]
-        pub struct CobsEncoderSliceAsync<'a>(CobsEncoderAsync<OutputSeekable<'a>>);
+        pub struct CobsEncoderSliceAsync<const N: usize>(CobsEncoderAsync<OutputSeekable<N>>);
 
-        impl<'a> CobsEncoderAsync<OutputSeekable<'a>> {
+        impl<const N: usize> CobsEncoderAsync<OutputSeekable<N>> {
             /// Creates an idle encoder.
             ///
             /// Returns a wrapper for CobsEncoderAsync that encodes into the provided mutable
             /// slice. The slice is not modified until the encoder writes to it. The slice is
             /// not required to be empty, and its contents are not validated or cleared.
-            pub fn new_to_slice(dest: &'a mut [u8]) -> CobsEncoderSliceAsync<'a> {
+            pub fn new_to_slice(dest: [u8; N]) -> CobsEncoderSliceAsync<N> {
                 CobsEncoderSliceAsync(CobsEncoderAsync::new(OutputSeekable::new(dest)))
             }
         }
 
-        impl<'a> CobsEncoderSliceAsync<'a>
+        impl<const N: usize> CobsEncoderSliceAsync<N>
         {
             /// Wrapper for CobsEncoderAsync::push_async that encodes into the provided mutable slice.
             pub async fn push_async<$S>(
@@ -835,18 +835,18 @@ macro_rules! define_encoder {
             }
 
             /// Wrapper for CobsEncoderAsync::dest.
-            pub fn dest(&'a self) -> &'a [u8] {
-                &self.0.dest().buf
+            pub fn dest(&self) -> &[u8] {
+                self.0.dest().buf.as_slice()
             }
 
             /// Wrapper for CobsEncoderAsync::dest_mut.
-            pub fn dest_mut(&'a mut self) -> &'a mut [u8]
+            pub fn dest_mut(&mut self) -> &mut [u8]
             {
-                &mut self.0.dest_mut().buf
+                self.0.dest_mut().buf.as_mut_slice()
             }
 
             /// Wrapper for CobsEncoderAsync::into_inner.
-            pub fn into_inner(self) -> &'a mut [u8]
+            pub fn into_inner(self) -> [u8; N]
             {
                 self.0.into_inner().buf
             }

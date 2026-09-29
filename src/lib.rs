@@ -181,9 +181,9 @@
 extern crate std;
 
 #[cfg(any(feature = "embedded-io", feature = "tokio"))]
-pub use codec::decode::DecodeProgress;
+pub use codec::{decode::DecodeProgress, DEFAULT_BUF_SIZE};
 #[cfg(any(feature = "embedded-io", feature = "tokio"))]
-pub use error::{CompletionError, DecodeError, EncodeError, SeekableError};
+pub use error::{CompletionError, DecodeError, EncodeError, SeekableError, CodecError};
 
 #[cfg(any(feature = "embedded-io", feature = "tokio"))]
 mod codec;
