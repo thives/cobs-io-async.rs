@@ -1,6 +1,8 @@
+mod buffered;
 mod decoding;
 mod encoding;
 mod support;
+mod sync;
 
 #[test]
 fn public_value_types_support_copy_equality_and_hashing() {

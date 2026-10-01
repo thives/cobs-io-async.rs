@@ -1,18 +1,102 @@
 #[cfg(feature = "embedded-io")]
-use cobs_io_async::embedded::{decode_to_slice_async, encode_from_slice_async};
+use cobs_io_async::embedded::{
+    CobsDecoderAsync, decode_to_slice_async, decode_to_slice_buffered_async,
+    encode_from_slice_async,
+};
 #[cfg(all(feature = "tokio", not(feature = "embedded-io")))]
-use cobs_io_async::tokio::{decode_to_slice_async, encode_from_slice_async};
-use cobs_io_async::{SeekableError, max_encoding_length};
+use cobs_io_async::tokio::{
+    CobsDecoderAsync, decode_to_slice_async, decode_to_slice_buffered_async,
+    encode_from_slice_async,
+};
+use cobs_io_async::{SeekableError, max_encoding_length, sync};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 #[cfg(feature = "embedded-io")]
-use embedded_io_async::{ErrorType, Seek, SeekFrom, Write};
+use embedded_io_async::{BufRead, ErrorType, Read, Seek, SeekFrom, Write};
 use futures::executor::block_on;
 use rand::RngExt;
 use std::hint::black_box;
 #[cfg(feature = "tokio")]
-use tokio::io::{AsyncSeek, AsyncWrite};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 const SIZES: [usize; 7] = [16, 256, 4096, 65536, 262144, 1048576, 4194304];
+
+/// Window size offered per fill by [`CountingReader`], similar to a typical
+/// `BufReader` capacity.
+const READER_WINDOW: usize = 4096;
+
+/// In-memory reader that offers at most [`READER_WINDOW`] bytes per call and
+/// counts read and fill calls, to show how many I/O calls each decoder makes.
+struct CountingReader<'a> {
+    data: &'a [u8],
+    calls: usize,
+}
+
+impl CountingReader<'_> {
+    fn read_into(&mut self, buf: &mut [u8]) -> usize {
+        self.calls += 1;
+        let n = buf.len().min(READER_WINDOW).min(self.data.len());
+        buf[..n].copy_from_slice(&self.data[..n]);
+        self.data = &self.data[n..];
+        n
+    }
+
+    fn window(&mut self) -> &[u8] {
+        self.calls += 1;
+        &self.data[..self.data.len().min(READER_WINDOW)]
+    }
+}
+
+#[cfg(feature = "embedded-io")]
+impl ErrorType for CountingReader<'_> {
+    type Error = core::convert::Infallible;
+}
+
+#[cfg(feature = "embedded-io")]
+impl Read for CountingReader<'_> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        Ok(self.read_into(buf))
+    }
+}
+
+#[cfg(feature = "embedded-io")]
+impl BufRead for CountingReader<'_> {
+    async fn fill_buf(&mut self) -> Result<&[u8], Self::Error> {
+        Ok(self.window())
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.data = &self.data[amt..];
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl AsyncRead for CountingReader<'_> {
+    fn poll_read(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> core::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let n = this.read_into(buf.initialize_unfilled());
+        buf.advance(n);
+        core::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl AsyncBufRead for CountingReader<'_> {
+    fn poll_fill_buf(
+        self: core::pin::Pin<&mut Self>,
+        _cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<std::io::Result<&[u8]>> {
+        core::task::Poll::Ready(Ok(self.get_mut().window()))
+    }
+
+    fn consume(self: core::pin::Pin<&mut Self>, amt: usize) {
+        let this = self.get_mut();
+        this.data = &this.data[amt..];
+    }
+}
 
 struct SliceWriter<'a> {
     buffer: &'a mut [u8],
@@ -149,6 +233,62 @@ fn decode_into(source: &[u8], destination: &mut [u8]) -> usize {
     usize::try_from(written).expect("decoded length does not fit usize")
 }
 
+fn decode_buffered_into(source: &[u8], destination: &mut [u8]) -> usize {
+    let mut reader = source;
+
+    let written = block_on(decode_to_slice_buffered_async(&mut reader, destination))
+        .expect("benchmark buffered decoding failed");
+
+    usize::try_from(written).expect("decoded length does not fit usize")
+}
+
+type DecodeFn = fn(&[u8], &mut [u8]) -> usize;
+
+/// Decodes the undelimited body with a stateful decoder, finishing the frame
+/// at EOF.
+fn decode_push_into(source: &[u8], destination: &mut [u8], buffered: bool) -> usize {
+    let mut reader = source;
+    let mut decoder = CobsDecoderAsync::new(SliceWriter {
+        buffer: destination,
+        position: 0,
+    });
+    let progress = if buffered {
+        block_on(decoder.push_buffered_async(&mut reader))
+    } else {
+        block_on(decoder.push_async(&mut reader))
+    }
+    .expect("benchmark push failed");
+    assert_eq!(progress.consumed as usize, source.len());
+    let written = decoder.finish_frame().expect("benchmark frame incomplete");
+
+    usize::try_from(written).expect("decoded length does not fit usize")
+}
+
+fn decode_sync_into(source: &[u8], destination: &mut [u8]) -> usize {
+    sync::decode_to_slice(source, destination)
+        .expect("benchmark sync decoding failed")
+        .len
+}
+
+/// Returns the read calls made by the unbuffered and buffered decoders when
+/// the source offers at most [`READER_WINDOW`] bytes per call.
+fn count_decode_calls(encoded: &[u8], destination: &mut [u8]) -> (usize, usize) {
+    let mut reader = CountingReader {
+        data: encoded,
+        calls: 0,
+    };
+    block_on(decode_to_slice_async(&mut reader, destination)).expect("counting decode failed");
+    let unbuffered = reader.calls;
+
+    let mut reader = CountingReader {
+        data: encoded,
+        calls: 0,
+    };
+    block_on(decode_to_slice_buffered_async(&mut reader, destination))
+        .expect("counting buffered decode failed");
+    (unbuffered, reader.calls)
+}
+
 fn bench_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode_input_seekable");
 
@@ -187,22 +327,47 @@ fn bench_decode(c: &mut Criterion) {
         let encoded_len = encode_into(&data, &mut encoded);
         encoded.truncate(encoded_len);
 
+        let variants: [(&str, DecodeFn); 5] = [
+            ("async_read", decode_into),
+            ("async_buf_read", decode_buffered_into),
+            ("sync", decode_sync_into),
+            ("push_async", |source, destination| {
+                decode_push_into(source, destination, false)
+            }),
+            ("push_buffered_async", |source, destination| {
+                decode_push_into(source, destination, true)
+            }),
+        ];
+
+        // Validate every variant before timing it.
         let mut output = vec![0u8; size];
-        assert_eq!(decode_into(&encoded, &mut output), size);
-        assert_eq!(output, data);
+        for (name, decode) in variants {
+            output.fill(0);
+            assert_eq!(decode(&encoded, &mut output), size, "{name}");
+            assert_eq!(output, data, "{name}");
+        }
+
+        let (unbuffered_calls, buffered_calls) = count_decode_calls(&encoded, &mut output);
+        assert!(buffered_calls <= unbuffered_calls);
+        println!(
+            "decode/{size}: {unbuffered_calls} read calls unbuffered, \
+             {buffered_calls} fill calls buffered ({READER_WINDOW}-byte window)"
+        );
 
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(size), &encoded, |b, encoded| {
-            b.iter(|| {
-                let written = decode_into(
-                    black_box(encoded.as_slice()),
-                    black_box(output.as_mut_slice()),
-                );
+        for (name, decode) in variants {
+            group.bench_with_input(BenchmarkId::new(name, size), &encoded, |b, encoded| {
+                b.iter(|| {
+                    let written = decode(
+                        black_box(encoded.as_slice()),
+                        black_box(output.as_mut_slice()),
+                    );
 
-                black_box(&output[..written]);
-                black_box(written);
+                    black_box(&output[..written]);
+                    black_box(written);
+                });
             });
-        });
+        }
     }
 
     group.finish();

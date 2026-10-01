@@ -12,30 +12,38 @@
 //!
 //! # Choose a backend
 //!
-//! No Cargo features are enabled by default. Enable the backend matching
-//! your application's I/O types:
+//! The `tokio` and `serde` features are enabled by default. Enable the
+//! backend matching your application's I/O types:
 //!
 //! | Feature | Module | I/O traits |
 //! |---|---|---|
-//! | `embedded-io` | `cobs_io_async::embedded` | `embedded_io_async::{Read, Write, Seek}` |
-//! | `tokio` | `cobs_io_async::tokio` | `tokio::io::{AsyncRead, AsyncWrite, AsyncSeek}` |
+//! | `embedded-io` | `cobs_io_async::embedded` | `embedded_io_async::{Read, BufRead, Write, Seek}` |
+//! | `tokio` | `cobs_io_async::tokio` | `tokio::io::{AsyncRead, AsyncBufRead, AsyncWrite, AsyncSeek}` |
 //!
-//! For example, to use the embedded backend:
+//! For example, to use only the embedded backend, disable the default
+//! features:
 //!
 //! ```toml
 //! [dependencies]
-//! cobs-io-async = { version = "0.1", default-features = false, features = ["embedded-io"] }
+//! cobs-io-async = { version = "0.0.2", default-features = false, features = ["embedded-io"] }
 //! ```
 //!
-//! For Tokio, select `features = ["tokio"]` instead. Both backends may be
-//! enabled together; their entry points remain in separate modules.
+//! For Tokio, the default features suffice, or select `features = ["tokio"]`
+//! explicitly. Both backends may be enabled together; their entry points
+//! remain in separate modules.
 //!
 //! The embedded backend supports `no_std`. The Tokio backend enables this
 //! crate's `std` feature. Neither backend creates an executor or spawns tasks;
 //! executor and runtime requirements depend on the supplied I/O types.
 //!
-//! Without a backend, the crate still exposes size helpers, [`DecodeProgress`],
-//! and the shared error types.
+//! Without a backend, the crate still exposes the synchronous [`sync`]
+//! module, size helpers, [`DecodeProgress`], and the shared error types.
+//!
+//! # In-memory encoding and decoding
+//!
+//! The [`sync`] module encodes and decodes directly between slices without
+//! asynchronous I/O. It is always available, including in `no_std` builds
+//! with `default-features = false`.
 //!
 //! # Encoding
 //!
@@ -65,6 +73,12 @@
 //! Both backend modules provide `CobsDecoderAsync` for incremental decoding
 //! and `decode_to_slice_async` for decoding one frame into a caller-provided
 //! slice. Decoding does not require seeking.
+//!
+//! `decode_to_slice_async` reads one byte at a time so that it never consumes
+//! input belonging to the next frame. For buffered sources, such as
+//! `tokio::io::BufReader` or `&[u8]`, `decode_to_slice_buffered_async` and
+//! `CobsDecoderAsync::push_buffered_async` inspect buffered input in larger
+//! steps and consume exactly through the frame's delimiter.
 //!
 //! **Input exhaustion is not frame completion for a stateful decoder.**
 //! A push stops at input exhaustion or the first delimiter completing or
@@ -181,14 +195,14 @@
 extern crate std;
 
 #[cfg(any(feature = "embedded-io", feature = "tokio"))]
-pub use codec::{decode::DecodeProgress, DEFAULT_BUF_SIZE};
-#[cfg(any(feature = "embedded-io", feature = "tokio"))]
-pub use error::{CompletionError, DecodeError, EncodeError, SeekableError, CodecError};
+pub use codec::DEFAULT_BUF_SIZE;
+pub use codec::decode::DecodeProgress;
+pub use error::{CodecError, CompletionError, DecodeError, EncodeError, SeekableError};
 
-#[cfg(any(feature = "embedded-io", feature = "tokio"))]
 mod codec;
-#[cfg(any(feature = "embedded-io", feature = "tokio"))]
 mod error;
+
+pub mod sync;
 
 #[cfg(test)]
 mod tests;

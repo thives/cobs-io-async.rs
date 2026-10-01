@@ -19,6 +19,7 @@ zero as its fixed delimiter; payload zeros are encoded as data.
 
 - Independent `embedded-io-async` and Tokio backends.
 - `no_std` support through the embedded backend.
+- Synchronous slice-to-slice encoding and decoding, available without any backend.
 - One-shot helpers and stateful, incremental codecs.
 - No heap allocation for normal codec processing.
 - Explicit frame completion and recovery after interrupted operations.
@@ -32,11 +33,14 @@ The package name is `cobs-io-async`; its Rust import name is `cobs_io_async`.
 `tokio` and `serde` features are enabled by default. Select the backend matching your I/O
 types.
 
+The examples below use the latest published release. Use `0.0.x` versions
+exactly as shown: Cargo treats `0.0.x` requirements as exact.
+
 ### Embedded I/O
 
 ```toml
 [dependencies]
-cobs-io-async = { version = "0.1", default-features = false, features = ["embedded-io"] }
+cobs-io-async = { version = "0.0.2", default-features = false, features = ["embedded-io"] }
 ```
 
 Use `cobs_io_async::embedded` with the traits from `embedded_io_async`.
@@ -46,7 +50,7 @@ This backend supports `no_std` and does not require a particular executor.
 
 ```toml
 [dependencies]
-cobs-io-async = { version = "0.1", features = ["tokio"] }
+cobs-io-async = { version = "0.0.2", features = ["tokio"] }
 ```
 
 Use `cobs_io_async::tokio` with Tokio's asynchronous I/O traits.
@@ -58,6 +62,30 @@ depend on the supplied I/O types.
 
 Both backends may be enabled together. Their APIs remain in separate
 modules.
+
+### In-memory only
+
+The synchronous `cobs_io_async::sync` module needs no asynchronous backend
+and supports `no_std`. When it is all you need, set
+`default-features = false` without selecting a backend feature.
+
+The `sync` module was added after the `0.0.2` release and is available in
+the next published version.
+
+```rust
+use cobs_io_async::{max_encoding_length, sync};
+
+fn main() {
+    let mut encoded = [0u8; max_encoding_length(3) + 2];
+    let len = sync::encode_from_slice_including_sentinels(&[7, 0, 8], &mut encoded).unwrap();
+    assert_eq!(&encoded[..len], &[0, 2, 7, 2, 8, 0]);
+
+    let mut decoded = [0u8; 3];
+    let frame = sync::decode_to_slice(&encoded[..len], &mut decoded).unwrap();
+    assert_eq!(decoded, [7, 0, 8]);
+    assert_eq!(frame.consumed, len);
+}
+```
 
 ## Quick start
 
@@ -127,16 +155,28 @@ Both backend modules expose the same entry-point names:
 | `encode_from_slice_async` | Encode one complete payload without delimiters. |
 | `encode_from_slice_including_sentinels_async` | Encode one complete payload with leading and trailing zero delimiters. |
 | `CobsEncoderAsync` | Combine successive payload chunks into one encoded body; finish with `finalize_async`. |
-| `decode_to_slice_async` | Decode one frame into a caller-provided slice. |
-| `CobsDecoderAsync` | Retain decoding state across successive input chunks. |
+| `decode_to_slice_async` | Decode one frame into a caller-provided slice, reading one byte at a time. |
+| `decode_to_slice_buffered_async` | Decode one frame from a buffered source (`BufRead` / `AsyncBufRead`), consuming exactly through the delimiter. |
+| `CobsDecoderAsync` | Retain decoding state across successive input chunks. `push_buffered_async` batches reads and writes from a buffered source. |
+
+The `sync` module provides `encode_from_slice`,
+`encode_from_slice_including_sentinels`, and `decode_to_slice` for data
+already in memory.
+
+`decode_to_slice_async` never consumes input after the frame delimiter, so
+it must read one byte per call from a plain `Read` or `AsyncRead` source.
+Prefer `decode_to_slice_buffered_async` or
+`CobsDecoderAsync::push_buffered_async` with a buffered source, such as
+`tokio::io::BufReader` or `&[u8]`, to batch reads without losing bytes from
+the next frame.
 
 Incremental encoding requires a seekable destination because it backpatches
 earlier code bytes. One-shot slice encoding writes sequentially and does not
 require destination seeking. Decoding never requires seeking.
 
-The crate root exposes shared error types, `DecodeProgress`,
-`max_encoding_overhead`, and `max_encoding_length`, even when no backend is
-enabled.
+The crate root exposes the `sync` module, shared error types,
+`DecodeProgress`, `max_encoding_overhead`, and `max_encoding_length`, even
+when no backend is enabled.
 
 `embedded_io_async::Write` is implemented for the embedded backend's `CobsEncoderAsync` and `CobsDecoderAsync`.
 

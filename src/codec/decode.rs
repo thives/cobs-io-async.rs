@@ -141,6 +141,12 @@ impl defmt::Format for DecoderState {
     }
 }
 
+/// Decoded bytes staged per destination write by `push_buffered_async`.
+///
+/// Kept small because the buffer lives in the operation's future, which
+/// matters for embedded targets.
+pub(crate) const PUSH_STAGING_LEN: usize = 64;
+
 pub(crate) enum DecodeAction {
     Skip,
     Write(u8),
@@ -201,6 +207,11 @@ impl DecoderCore {
         self.written += 1;
     }
 
+    #[inline]
+    pub(crate) fn acknowledge_writes(&mut self, count: usize) {
+        self.written += count as u64;
+    }
+
     fn reset_frame(&mut self) -> u64 {
         self.state = DecoderState::new();
         self.frame_started = false;
@@ -236,6 +247,98 @@ impl DecoderCore {
     }
 }
 
+/// Why [`SliceFrameDecoder::push`] stopped processing a chunk.
+pub(crate) enum ChunkStatus {
+    /// The whole chunk was consumed without completing or invalidating the frame.
+    Exhausted,
+    /// A delimiter completed the frame with the contained decoded length.
+    Complete(u64),
+    /// A delimiter arrived inside an incomplete block.
+    Invalid,
+    /// The destination cannot hold the next decoded byte.
+    DestinationFull,
+}
+
+/// Decodes a single frame into a caller-provided slice.
+///
+/// Shared by the synchronous slice API and the backends' one-shot
+/// `decode_to_slice*` helpers, so that all of them agree on padding,
+/// delimiter, EOF, and capacity semantics.
+pub(crate) struct SliceFrameDecoder<'a> {
+    core: DecoderCore,
+    dest: &'a mut [u8],
+    written: usize,
+    consumed: u64,
+}
+
+impl<'a> SliceFrameDecoder<'a> {
+    pub(crate) fn new(dest: &'a mut [u8]) -> Self {
+        Self {
+            core: DecoderCore::new(),
+            dest,
+            written: 0,
+            consumed: 0,
+        }
+    }
+
+    /// Processes `input` until it is exhausted or processing must stop.
+    ///
+    /// Returns the number of bytes consumed from `input`. A completing or
+    /// invalidating delimiter is consumed, as is the encoded byte that would
+    /// overflow the destination. Bytes after the stopping point are untouched.
+    #[inline]
+    pub(crate) fn push(&mut self, input: &[u8]) -> (usize, ChunkStatus) {
+        for (idx, &byte) in input.iter().enumerate() {
+            let status = match self.core.accept_byte(byte) {
+                DecodeAction::Skip => continue,
+                DecodeAction::Write(value) => match self.dest.get_mut(self.written) {
+                    Some(slot) => {
+                        *slot = value;
+                        self.written += 1;
+                        self.core.acknowledge_write();
+                        continue;
+                    }
+                    None => ChunkStatus::DestinationFull,
+                },
+                DecodeAction::FrameComplete(len) => ChunkStatus::Complete(len),
+                DecodeAction::InvalidFrame => ChunkStatus::Invalid,
+            };
+            self.consumed += idx as u64 + 1;
+            return (idx + 1, status);
+        }
+        self.consumed += input.len() as u64;
+        (input.len(), ChunkStatus::Exhausted)
+    }
+
+    /// Converts a terminal status into the one-shot result, or `None` when
+    /// more input is required.
+    pub(crate) fn outcome<S, D>(
+        &self,
+        status: ChunkStatus,
+        destination_full: impl FnOnce() -> D,
+    ) -> Option<Result<u64, DecodeError<S, D>>> {
+        match status {
+            ChunkStatus::Exhausted => None,
+            ChunkStatus::Complete(len) => Some(Ok(len)),
+            ChunkStatus::Invalid => Some(Err(DecodeError::InvalidFrame(DecodeProgress {
+                consumed: self.consumed,
+                written: self.written as u64,
+                frame_len: None,
+            }))),
+            ChunkStatus::DestinationFull => Some(Err(DecodeError::Destination(destination_full()))),
+        }
+    }
+
+    /// Accepts EOF as the end of a started, structurally complete frame.
+    pub(crate) fn finish_at_eof<S, D>(&mut self) -> Result<u64, DecodeError<S, D>> {
+        self.core.finish_frame().map_err(|error| match error {
+            CompletionError::IncompleteFrame(_) => DecodeError::UnexpectedSourceEof,
+            CompletionError::InvalidState => DecodeError::Poisoned,
+            CompletionError::NoFrame => DecodeError::EmptyFrame,
+        })
+    }
+}
+
 impl core::fmt::Display for DecoderCore {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
@@ -264,11 +367,12 @@ macro_rules! define_decoder {
     (
         $D:ident: [$($writer_bounds:tt)+],
         $S:ident: [$($reader_bounds:tt)+],
+        buffered: [$($buf_reader_bounds:tt)+],
         errors: [$source_error:ty, $dest_error:ty],
         slice_source_error: $slice_source_error:ty,
         slice_dest_error: $slice_dest_error:ty,
     ) => {
-        use $crate::codec::{decode::{DecodeAction, DecoderCore}, OutputSeekable};
+        use $crate::codec::{decode::{DecodeAction, DecoderCore, PUSH_STAGING_LEN}, OutputSeekable};
         use $crate::{DecodeError, DecodeProgress};
 
         /// Incrementally decodes zero-delimited COBS frames into an asynchronous writer.
@@ -623,6 +727,103 @@ macro_rules! define_decoder {
                 }
             }
 
+            /// Decodes input from a buffered source until input exhaustion or a frame
+            /// boundary, batching reads and destination writes.
+            ///
+            /// Has the framing, progress, error, and cancellation behavior of
+            /// [`push_async`](Self::push_async), but inspects the source's buffered input
+            /// instead of reading one byte at a time. The source must implement
+            /// `embedded_io_async::BufRead` for the embedded backend, or
+            /// `tokio::io::AsyncBufRead + Unpin` for Tokio.
+            ///
+            /// An empty `fill_buf` result ends this call successfully, like a read
+            /// returning `Ok(0)` for `push_async`.
+            ///
+            /// # Frame boundaries and batching
+            ///
+            /// Only processed bytes are consumed. A delimiter completing or invalidating
+            /// an active frame is consumed, and subsequent input remains buffered in
+            /// `source`.
+            ///
+            /// Decoded bytes are staged and written in batches of at most 64 bytes. All
+            /// staged output of a frame is acknowledged by the destination before that
+            /// frame's delimiter is consumed. After a destination failure, the delimiter
+            /// therefore remains unread, and
+            /// [`discard_frame_async`](Self::discard_frame_async) resynchronizes at it
+            /// as it would after `push_async`.
+            ///
+            /// # Differences from `push_async`
+            ///
+            /// - A failed or cancelled batch write may already have consumed input for
+            ///   the entire batch, and `progress.written` counts only acknowledged batches.
+            ///   As with `push_async`, errors provide no reliable retry offset.
+            /// - The embedded backend's `write_all` panics on a zero-progress write;
+            ///   Tokio reports `std::io::ErrorKind::WriteZero`. See `push_async`.
+            pub async fn push_buffered_async<$S>(
+                &mut self,
+                source: &mut $S,
+            ) -> Result<DecodeProgress, DecodeError<$source_error, $dest_error>>
+            where
+                $S: $($buf_reader_bounds)+,
+            {
+                if !self.core.begin_push() {
+                    return Err(DecodeError::Poisoned);
+                }
+                let mut progress = DecodeProgress::default();
+                let mut staged = [0u8; PUSH_STAGING_LEN];
+                loop {
+                    let input = source.fill_buf().await.map_err(DecodeError::Source)?;
+                    if input.is_empty() {
+                        self.core.finish_push();
+                        return Ok(progress);
+                    }
+                    let mut used = 0;
+                    let mut len = 0;
+                    let mut boundary = None;
+                    for &byte in input {
+                        // Flush staged output before consuming a delimiter, so that a
+                        // write failure leaves the delimiter available for recovery.
+                        if len == staged.len() || (byte == 0 && len > 0) {
+                            break;
+                        }
+                        used += 1;
+                        match self.core.accept_byte(byte) {
+                            DecodeAction::Skip => {}
+                            DecodeAction::Write(value) => {
+                                staged[len] = value;
+                                len += 1;
+                            }
+                            action => {
+                                boundary = Some(action);
+                                break;
+                            }
+                        }
+                    }
+                    source.consume(used);
+                    progress.consumed += used as u64;
+                    if len > 0 {
+                        self.dest
+                            .write_all(&staged[..len])
+                            .await
+                            .map_err(DecodeError::Destination)?;
+                        self.core.acknowledge_writes(len);
+                        progress.written += len as u64;
+                    }
+                    match boundary {
+                        Some(DecodeAction::FrameComplete(frame_len)) => {
+                            progress.frame_len = Some(frame_len);
+                            self.core.finish_push();
+                            return Ok(progress);
+                        }
+                        Some(DecodeAction::InvalidFrame) => {
+                            self.core.finish_push();
+                            return Err(DecodeError::InvalidFrame(progress));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             /// Decodes `source` as a chunk of the current encoded stream.
             ///
             /// Directly processes the slice, stopping at its end or the first delimiter
@@ -745,9 +946,21 @@ macro_rules! define_decoder {
             ) -> Result<DecodeProgress, DecodeError<$source_error, $slice_source_error>>
             where
                 $S: $($reader_bounds)+,
-        {
-            self.0.push_async(source).await
-        }
+            {
+                self.0.push_async(source).await
+            }
+
+            /// Wrapper for CobsDecoderAsync::push_buffered_async that decodes into the
+            /// provided mutable slice.
+            pub async fn push_buffered_async<$S>(
+                &mut self,
+                source: &mut $S,
+            ) -> Result<DecodeProgress, DecodeError<$source_error, $slice_source_error>>
+            where
+                $S: $($buf_reader_bounds)+,
+            {
+                self.0.push_buffered_async(source).await
+            }
 
             /// Wrapper for CobsDecoderAsync::push_slice_async that decodes a slice into the provided
             /// mutable slice.

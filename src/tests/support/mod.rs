@@ -14,4 +14,7 @@ pub(super) mod tokio_writer;
 pub(super) mod decoder_suite;
 
 #[cfg(any(feature = "embedded-io", feature = "tokio"))]
+pub(super) mod chunked_reader;
+
+#[cfg(any(feature = "embedded-io", feature = "tokio"))]
 pub(super) use writer::{Action, Event, WakeCounter};

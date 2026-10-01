@@ -1,12 +1,14 @@
-use crate::CompletionError;
-use ::tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use ::tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+};
 use std::io;
 
-use crate::codec::decode::define_decoder;
+use crate::codec::decode::{SliceFrameDecoder, define_decoder};
 
 define_decoder! {
     D: [AsyncWrite + Unpin],
     S: [AsyncRead + Unpin + ?Sized],
+    buffered: [AsyncBufRead + Unpin + ?Sized],
     errors: [io::Error, io::Error],
     slice_source_error: io::Error,
     slice_dest_error: io::Error,
@@ -40,6 +42,14 @@ define_decoder! {
 ///
 /// Each invocation creates fresh decoding state. Repeated calls do not
 /// combine incomplete input into one frame.
+///
+/// # Read granularity
+///
+/// Because a plain `AsyncRead` source cannot return unconsumed bytes, this
+/// function requests one byte per read so that it never consumes input after
+/// the delimiter. When the source implements `tokio::io::AsyncBufRead`, such
+/// as `tokio::io::BufReader`, prefer [`decode_to_slice_buffered_async`],
+/// which batches reads with the same frame-boundary behavior.
 ///
 /// # Errors
 ///
@@ -110,38 +120,83 @@ pub async fn decode_to_slice_async<S>(
 where
     S: AsyncRead + Unpin + ?Sized,
 {
-    use crate::codec::decode::{DecodeAction, DecoderCore};
-    let mut decoder = DecoderCore::new();
-    let mut progress = DecodeProgress::default();
-    let mut output = dest.iter_mut();
+    let mut decoder = SliceFrameDecoder::new(dest);
     let mut byte = [0u8; 1];
     loop {
         let n = source.read(&mut byte).await.map_err(DecodeError::Source)?;
         if n == 0 {
-            return decoder.finish_frame().map_err(|error| match error {
-                CompletionError::IncompleteFrame(_) => DecodeError::UnexpectedSourceEof,
-                CompletionError::InvalidState => DecodeError::Poisoned,
-                CompletionError::NoFrame => DecodeError::EmptyFrame,
-            });
+            return decoder.finish_at_eof();
         }
-        progress.consumed += 1;
-        match decoder.accept_byte(byte[0]) {
-            DecodeAction::Skip => {}
-            DecodeAction::Write(value) => {
-                let slot = output.next().ok_or_else(|| {
-                    DecodeError::Destination(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        crate::SeekableError::OutOfBounds,
-                    ))
-                })?;
-                *slot = value;
-                decoder.acknowledge_write();
-                progress.written += 1;
-            }
-            DecodeAction::FrameComplete(len) => return Ok(len),
-            DecodeAction::InvalidFrame => {
-                return Err(DecodeError::InvalidFrame(progress));
-            }
+        let (_, status) = decoder.push(&byte);
+        if let Some(result) = decoder.outcome(status, destination_full) {
+            return result;
         }
     }
+}
+
+/// Decodes one COBS frame from a buffered source into the beginning of `dest`.
+///
+/// Behaves like [`decode_to_slice_async`], including its padding, EOF,
+/// capacity, error, cancellation, and execution behavior, but inspects the
+/// source's buffered input through `AsyncBufReadExt::fill_buf` instead of
+/// reading one byte at a time. Only bytes through the frame's terminating
+/// delimiter are consumed; bytes belonging to subsequent frames remain
+/// buffered in `source`.
+///
+/// Wrap an unbuffered reader in `tokio::io::BufReader` to use this function.
+/// Keep using the same `BufReader` for subsequent frames: dropping it
+/// discards any input it has buffered.
+///
+/// On a capacity error, input is consumed through the encoded byte that
+/// produced the rejected output byte, matching [`decode_to_slice_async`].
+///
+/// # Example
+///
+/// ```
+/// use cobs_io_async::tokio::decode_to_slice_buffered_async;
+/// use tokio::io::BufReader;
+///
+/// # futures::executor::block_on(async {
+/// let encoded: &[u8] = &[0, 2, 7, 2, 8, 0, 2, 9, 0];
+/// let mut source = BufReader::new(encoded);
+/// let mut output = [0u8; 3];
+///
+/// let written = decode_to_slice_buffered_async(&mut source, &mut output)
+///     .await
+///     .unwrap();
+/// assert_eq!(written, 3);
+/// assert_eq!(output, [7, 0, 8]);
+///
+/// let written = decode_to_slice_buffered_async(&mut source, &mut output)
+///     .await
+///     .unwrap();
+/// assert_eq!(&output[..written as usize], &[9]);
+/// # });
+/// ```
+pub async fn decode_to_slice_buffered_async<S>(
+    source: &mut S,
+    dest: &mut [u8],
+) -> Result<u64, DecodeError<io::Error, io::Error>>
+where
+    S: AsyncBufRead + Unpin + ?Sized,
+{
+    let mut decoder = SliceFrameDecoder::new(dest);
+    loop {
+        let input = source.fill_buf().await.map_err(DecodeError::Source)?;
+        if input.is_empty() {
+            return decoder.finish_at_eof();
+        }
+        let (consumed, status) = decoder.push(input);
+        source.consume(consumed);
+        if let Some(result) = decoder.outcome(status, destination_full) {
+            return result;
+        }
+    }
+}
+
+fn destination_full() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        crate::SeekableError::OutOfBounds,
+    )
 }

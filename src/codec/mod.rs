@@ -1,17 +1,31 @@
+// The backend-specific state machines, macros, and slice adapters in these
+// modules are unused when only the synchronous API is compiled.
+#[cfg_attr(
+    not(any(feature = "embedded-io", feature = "tokio")),
+    allow(dead_code, unused_imports, unused_macros)
+)]
 pub(crate) mod decode;
+#[cfg_attr(
+    not(any(feature = "embedded-io", feature = "tokio")),
+    allow(dead_code, unused_imports, unused_macros)
+)]
 pub(crate) mod encode;
 
+#[cfg(any(feature = "embedded-io", feature = "tokio"))]
 use crate::error::SeekableError;
 
 /// Default internal buffer size in bytes used by the backend codec wrappers.
+#[cfg(any(feature = "embedded-io", feature = "tokio"))]
 pub const DEFAULT_BUF_SIZE: usize = 256;
 
+#[cfg(any(feature = "embedded-io", feature = "tokio"))]
 #[derive(Debug)]
 pub struct OutputSeekable<const N: usize> {
     pub(crate) buf: [u8; N],
     idx: usize,
 }
 
+#[cfg(any(feature = "embedded-io", feature = "tokio"))]
 impl<const N: usize> OutputSeekable<N> {
     pub(crate) fn new(buf: [u8; N]) -> Self {
         Self { buf, idx: 0 }

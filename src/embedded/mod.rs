@@ -4,7 +4,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! cobs-io-async = { version = "0.1", default-features = false, features = ["embedded-io"] }
+//! cobs-io-async = { version = "0.0.2", default-features = false, features = ["embedded-io"] }
 //! ```
 //!
 //! This backend supports `no_std` environments and does not require heap
@@ -20,11 +20,19 @@
 //! | Encode a slice with surrounding delimiters | [`encode_from_slice_including_sentinels_async`] | Destination: `Write` |
 //! | Encode successive payload chunks | [`CobsEncoderAsync`] | Destination: `Write + Seek`; reader input: `Read` |
 //! | Decode one frame into a slice | [`decode_to_slice_async`] | Source: `Read` |
-//! | Decode successive encoded chunks | [`CobsDecoderAsync`] | Destination: `Write`; reader input: `Read` |
+//! | Decode one frame into a slice with batched reads | [`decode_to_slice_buffered_async`] | Source: `BufRead` |
+//! | Decode successive encoded chunks | [`CobsDecoderAsync`] | Destination: `Write`; reader input: `Read`, or `BufRead` for [`push_buffered_async`](CobsDecoderAsync::push_buffered_async) |
 //!
-//! `Read`, `Write`, and `Seek` refer to the `embedded_io_async` traits.
+//! `Read`, `BufRead`, `Write`, and `Seek` refer to the `embedded_io_async` traits.
 //! Only incremental encoding requires a seekable destination, because it
 //! backpatches earlier code bytes. Decoding never requires seeking.
+//!
+//! [`decode_to_slice_async`] reads one byte at a time so that it never
+//! consumes input belonging to the next frame. [`decode_to_slice_buffered_async`]
+//! and [`CobsDecoderAsync::push_buffered_async`] keep that guarantee while
+//! inspecting and consuming buffered input in larger steps. For input already
+//! in memory, the synchronous [`crate::sync`] module avoids asynchronous I/O
+//! altogether.
 //!
 //! # Framing
 //!
@@ -89,9 +97,11 @@ mod decode;
 mod encode;
 
 #[doc(inline)]
-pub use decode::{CobsDecoderAsync, CobsDecoderSliceAsync, decode_to_slice_async};
+pub use decode::{
+    CobsDecoderAsync, CobsDecoderSliceAsync, decode_to_slice_async, decode_to_slice_buffered_async,
+};
 
-pub use embedded_io_async::{ErrorType, Read, Seek, Write};
+pub use embedded_io_async::{BufRead, ErrorType, Read, Seek, Write};
 
 #[doc(inline)]
 pub use encode::{

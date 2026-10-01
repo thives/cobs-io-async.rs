@@ -5,7 +5,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! cobs-io-async = { version = "0.1", features = ["tokio"] }
+//! cobs-io-async = { version = "0.0.2", features = ["tokio"] }
 //! ```
 //!
 //! This backend uses Tokio's `AsyncRead`, `AsyncWrite`, and `AsyncSeek`
@@ -24,12 +24,20 @@
 //! | Encode a slice with surrounding delimiters | [`encode_from_slice_including_sentinels_async`] | Destination: `AsyncWrite + Unpin` |
 //! | Encode successive payload chunks | [`CobsEncoderAsync`] | Destination: `AsyncWrite + AsyncSeek + Unpin`; reader input: `AsyncRead + Unpin` |
 //! | Decode one frame into a slice | [`decode_to_slice_async`] | Source: `AsyncRead + Unpin` |
-//! | Decode successive encoded chunks | [`CobsDecoderAsync`] | Destination: `AsyncWrite + Unpin`; reader input: `AsyncRead + Unpin` |
+//! | Decode one frame into a slice with batched reads | [`decode_to_slice_buffered_async`] | Source: `AsyncBufRead + Unpin` |
+//! | Decode successive encoded chunks | [`CobsDecoderAsync`] | Destination: `AsyncWrite + Unpin`; reader input: `AsyncRead + Unpin`, or `AsyncBufRead + Unpin` for [`push_buffered_async`](CobsDecoderAsync::push_buffered_async) |
 //!
 //! Only incremental encoding requires a seekable destination, because it
 //! backpatches earlier code bytes. Decoding never requires seeking.
 //! The APIs do not impose `Send` or `'static` bounds; additional bounds may
 //! be required when moving their futures between threads or spawning tasks.
+//!
+//! [`decode_to_slice_async`] reads one byte at a time so that it never
+//! consumes input belonging to the next frame. [`decode_to_slice_buffered_async`]
+//! and [`CobsDecoderAsync::push_buffered_async`] keep that guarantee while
+//! inspecting and consuming buffered input in larger steps; wrap unbuffered
+//! readers in `tokio::io::BufReader`. For input already in memory, the
+//! synchronous [`crate::sync`] module avoids asynchronous I/O altogether.
 //!
 //! # Framing
 //!
@@ -95,10 +103,14 @@ mod decode;
 mod encode;
 
 #[doc(inline)]
-pub use decode::{CobsDecoderAsync, CobsDecoderSliceAsync, decode_to_slice_async};
+pub use decode::{
+    CobsDecoderAsync, CobsDecoderSliceAsync, decode_to_slice_async, decode_to_slice_buffered_async,
+};
 
 use core::convert::Infallible;
-pub use tokio::io::{AsyncRead, AsyncWrite, AsyncSeek, ReadBuf, Result, Error, ErrorKind};
+pub use tokio::io::{
+    AsyncBufRead, AsyncRead, AsyncWrite, AsyncSeek, ReadBuf, Result, Error, ErrorKind,
+};
 
 #[doc(inline)]
 pub use encode::{
