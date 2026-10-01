@@ -110,7 +110,7 @@ pub use encode::{
 };
 
 use crate::codec::DEFAULT_BUF_SIZE;
-use crate::{DecodeError, EncodeError, SeekableError, CodecError};
+use crate::{CodecError, DecodeError, EncodeError, SeekableError};
 
 /// COBS codec wrapper around an `embedded-io` stream.
 ///
@@ -135,7 +135,8 @@ impl<S> ErrorType for CobsAsync<S>
 where
     S: Read + Write,
 {
-    type Error = CodecError<DecodeError<S::Error, SeekableError>, EncodeError<SeekableError, S::Error>>;
+    type Error =
+        CodecError<DecodeError<S::Error, SeekableError>, EncodeError<SeekableError, S::Error>>;
 }
 
 impl<S> Read for CobsAsync<S>
@@ -162,7 +163,9 @@ where
     S: Read + Write,
 {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        let n = encode_from_slice_including_sentinels_async(buf, &mut self.stream).await.map_err(CodecError::Encode)?;
+        let n = encode_from_slice_including_sentinels_async(buf, &mut self.stream)
+            .await
+            .map_err(CodecError::Encode)?;
         Ok(n as usize)
     }
 

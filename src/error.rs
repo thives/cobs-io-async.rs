@@ -357,8 +357,7 @@ impl<D> From<EncodeError<Infallible, D>> for EncodeError<SeekableError, D> {
 ///
 /// The type parameters preserve the backend error types from the
 /// underlying decode or encode operation.
-pub enum CodecError<DecodeError, EncodeError>
-{
+pub enum CodecError<DecodeError, EncodeError> {
     /// The error came from the decode path.
     Decode(DecodeError),
     /// The error came from the encode path.

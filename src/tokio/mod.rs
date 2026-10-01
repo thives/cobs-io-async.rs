@@ -109,7 +109,7 @@ pub use decode::{
 
 use core::convert::Infallible;
 pub use tokio::io::{
-    AsyncBufRead, AsyncRead, AsyncWrite, AsyncSeek, ReadBuf, Result, Error, ErrorKind,
+    AsyncBufRead, AsyncRead, AsyncSeek, AsyncWrite, Error, ErrorKind, ReadBuf, Result,
 };
 
 #[doc(inline)]
@@ -118,7 +118,7 @@ pub use encode::{
     encode_from_slice_including_sentinels_async,
 };
 
-use core::pin::{pin, Pin};
+use core::pin::{Pin, pin};
 use core::task::{Context, Poll};
 
 use crate::codec::DEFAULT_BUF_SIZE;
@@ -129,7 +129,10 @@ use crate::{CompletionError, DecodeError, EncodeError};
 /// Implements [`AsyncRead`] and [`AsyncWrite`] when `S` does, so encoded
 /// frames are written to and decoded from the wrapped stream. Writes are
 /// finalized into a delimited frame by [`AsyncWrite::poll_shutdown`].
-pub struct CobsAsync<S> where S: Unpin {
+pub struct CobsAsync<S>
+where
+    S: Unpin,
+{
     stream: S,
     encoder: CobsEncoderSliceAsync<DEFAULT_BUF_SIZE>,
     decoder: CobsDecoderSliceAsync<DEFAULT_BUF_SIZE>,
@@ -141,7 +144,9 @@ pub struct CobsAsync<S> where S: Unpin {
     shutdown_flush: Option<(usize, usize)>,
 }
 
-impl<S> CobsAsync<S> where S: Unpin
+impl<S> CobsAsync<S>
+where
+    S: Unpin,
 {
     /// Creates a codec wrapper around `stream`.
     pub fn new(stream: S) -> Self {
@@ -159,9 +164,15 @@ impl<S> CobsAsync<S> where S: Unpin
     }
 }
 
-impl<S> AsyncRead for CobsAsync<S> where S: AsyncRead + Unpin
+impl<S> AsyncRead for CobsAsync<S>
+where
+    S: AsyncRead + Unpin,
 {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<Result<()>> {
         let this = self.get_mut();
         loop {
             if let Some(len) = this.pending_frame {
@@ -191,12 +202,19 @@ impl<S> AsyncRead for CobsAsync<S> where S: AsyncRead + Unpin
                         this.pending_frame = Some(len as usize);
                         continue;
                     }
-                    Err(CompletionError::IncompleteFrame(_)) =>
-                        return Poll::Ready(Err(Error::new(ErrorKind::UnexpectedEof, "truncated COBS frame"))),
-                    Err(CompletionError::NoFrame) =>
-                        return Poll::Ready(Ok(())),
-                    Err(CompletionError::InvalidState) =>
-                        return Poll::Ready(Err(Error::new(ErrorKind::InvalidData, "decoder poisoned"))),
+                    Err(CompletionError::IncompleteFrame(_)) => {
+                        return Poll::Ready(Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "truncated COBS frame",
+                        )));
+                    }
+                    Err(CompletionError::NoFrame) => return Poll::Ready(Ok(())),
+                    Err(CompletionError::InvalidState) => {
+                        return Poll::Ready(Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "decoder poisoned",
+                        )));
+                    }
                 }
             }
             let progress = {
@@ -217,12 +235,17 @@ impl<S> AsyncRead for CobsAsync<S> where S: AsyncRead + Unpin
     }
 }
 
-impl<S> AsyncWrite for CobsAsync<S> where S: AsyncWrite + Unpin
+impl<S> AsyncWrite for CobsAsync<S>
+where
+    S: AsyncWrite + Unpin,
 {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize>> {
         let this = self.get_mut();
         if this.shutdown_flush.is_some() {
-            return Poll::Ready(Err(Error::new(ErrorKind::BrokenPipe, "stream already shut down")));
+            return Poll::Ready(Err(Error::new(
+                ErrorKind::BrokenPipe,
+                "stream already shut down",
+            )));
         }
         let mut fut = pin!(this.encoder.push_slice_async(buf));
         match fut.as_mut().poll(cx) {
@@ -236,7 +259,6 @@ impl<S> AsyncWrite for CobsAsync<S> where S: AsyncWrite + Unpin
             Poll::Pending => Poll::Pending,
         }
     }
-
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
         Pin::new(&mut self.get_mut().stream).poll_flush(cx)
@@ -260,7 +282,10 @@ impl<S> AsyncWrite for CobsAsync<S> where S: AsyncWrite + Unpin
                 {
                     Poll::Ready(Ok(n)) => {
                         if n == 0 && written < total {
-                            return Poll::Ready(Err(Error::new(ErrorKind::WriteZero, "zero-byte write")));
+                            return Poll::Ready(Err(Error::new(
+                                ErrorKind::WriteZero,
+                                "zero-byte write",
+                            )));
                         }
                         this.shutdown_flush = Some((total, written + n));
                         if written + n == total {
@@ -283,7 +308,9 @@ fn io_error_from_decode(e: DecodeError<Error, Error>) -> Error {
     match e {
         DecodeError::Source(e) | DecodeError::Destination(e) => e,
         DecodeError::InvalidFrame(_) => Error::new(ErrorKind::InvalidData, "invalid COBS frame"),
-        DecodeError::UnexpectedSourceEof => Error::new(ErrorKind::UnexpectedEof, "truncated COBS frame"),
+        DecodeError::UnexpectedSourceEof => {
+            Error::new(ErrorKind::UnexpectedEof, "truncated COBS frame")
+        }
         DecodeError::EmptyFrame => Error::new(ErrorKind::InvalidData, "empty COBS frame"),
         DecodeError::Poisoned => Error::new(ErrorKind::InvalidData, "codec poisoned"),
     }
@@ -310,7 +337,9 @@ fn io_error_from_encode<SourceError: IntoIoError>(e: EncodeError<SourceError, Er
     match e {
         EncodeError::Source(e) => e.into_io_error(),
         EncodeError::Destination(e) => e,
-        EncodeError::UnexpectedSourceEof => Error::new(ErrorKind::UnexpectedEof, "truncated COBS frame"),
+        EncodeError::UnexpectedSourceEof => {
+            Error::new(ErrorKind::UnexpectedEof, "truncated COBS frame")
+        }
         EncodeError::Poisoned => Error::new(ErrorKind::InvalidData, "codec poisoned"),
         EncodeError::SourceChanged => todo!(),
         EncodeError::WriteZero => todo!(),
