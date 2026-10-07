@@ -1,219 +1,212 @@
-//! # Asynchronous COBS encoding and decoding
+//! # Reliable byte streams over COBS framing
 //!
-//! Encode and decode Consistent Overhead Byte Stuffing (COBS) frames using
-//! independent embedded and Tokio asynchronous I/O backends.
-//!
-//! COBS transforms a payload into an encoded body containing no zero bytes.
-//! Zero can then delimit frames in a byte stream. Payload zeros are encoded
-//! as data; this crate uses zero as its fixed delimiter.
+//! A runtime-independent, `no_std` transport for an unreliable point-to-point
+//! link, such as a serial line. [`Reliable`] implements [`Transport`], a
+//! poll-based byte-stream interface. It splits written bytes into packets,
+//! frames them with Consistent Overhead Byte Stuffing (COBS), verifies them
+//! with a checksum, acknowledges them, and retransmits lost ones. Packet
+//! boundaries are internal: applications write and read bytes.
 //!
 //! The Cargo package is `cobs-io-async`; the Rust import name is
 //! `cobs_io_async`.
 //!
-//! # Choose a backend
+//! # Overview
 //!
-//! The `tokio` and `serde` features are enabled by default. Enable the
-//! backend matching your application's I/O types:
+//! | Item | Role |
+//! |---|---|
+//! | [`Transport`] | Poll-based byte-stream trait, both for the underlying link you supply and for [`Reliable`] itself. |
+//! | [`Timer`] | Monotonic clock and wakeup source you supply for retransmission deadlines. |
+//! | [`Reliable`] | The connection. Wraps a [`Transport`] and a [`Timer`]. |
+//! | [`Config`] | Session identifier, retransmission timeout and retry limit. |
+//! | [`sync`] | In-memory COBS encoding and decoding between slices. |
 //!
-//! | Feature | Module | I/O traits |
-//! |---|---|---|
-//! | `embedded-io` | `cobs_io_async::embedded` | `embedded_io_async::{Read, BufRead, Write, Seek}` |
-//! | `tokio` | `cobs_io_async::tokio` | `tokio::io::{AsyncRead, AsyncBufRead, AsyncWrite, AsyncSeek}` |
+//! This crate provides no adapters for any runtime and spawns no tasks. You
+//! implement [`Transport`] for your serial port, socket or driver, and
+//! [`Timer`] for your clock, and wrap them in whatever your runtime needs.
+//! Neither trait requires `Send`, `'static` or pinning.
 //!
-//! For example, to use only the embedded backend, disable the default
-//! features:
+//! **Nothing happens unless the connection is polled.** Retransmissions,
+//! acknowledgments and incoming data are processed only inside
+//! [`Transport::poll_read`], [`Transport::poll_write`],
+//! [`Transport::poll_flush`] and [`Reliable::poll_progress`]. While none of
+//! these is pending, call [`Reliable::poll_progress`] from a task of your own
+//! to keep the connection alive.
 //!
-//! ```toml
-//! [dependencies]
-//! cobs-io-async = { version = "0.0.2", default-features = false, features = ["embedded-io"] }
+//! # Behavior
+//!
+//! | Operation | Behavior |
+//! |---|---|
+//! | `poll_write(buf)` | Copies a nonempty prefix of `buf` into the outgoing packet and returns the number of bytes accepted, at most [`Reliable::MAX_PAYLOAD`]. Returns `Pending` while the previous packet is unacknowledged. |
+//! | `poll_read(buf)` | Copies verified payload bytes into `buf`. Packet boundaries are invisible. Returns `Pending` while no payload is available. |
+//! | `poll_flush()` | Completes when all accepted data is acknowledged by the peer and the underlying transport has been flushed. |
+//! | Empty `buf` | Returns `Ready(Ok(0))` and creates no packet. |
+//! | Corrupted or malformed frame | Discarded silently. Retransmission provides recovery. |
+//! | Incoming payload slot full | New DATA is discarded without acknowledgment, so the peer retransmits it. Acknowledgments and duplicates are still processed. |
+//! | Transport error, EOF, retries exhausted, sequence numbers exhausted | The connection fails permanently. See [`ConnectionError`]. |
+//! | Dropping a future awaiting a poll method | Harmless. All protocol state is owned by the connection. |
+//!
+//! Every poll method drives both directions, performing a bounded amount of
+//! work per call. If work remains when the budget is spent, the task is woken
+//! before `Pending` is returned, so an always-ready transport cannot
+//! monopolize the executor.
+//!
+//! # Underlying transport requirements
+//!
+//! The link underneath [`Reliable`] must behave as a byte stream that may
+//! lose, corrupt, insert or delete bytes, but must not reorder or delay them
+//! beyond the retransmission timeout:
+//!
+//! - `poll_read` returning `Ok(0)` for a nonempty buffer means end of
+//!   stream. Temporary lack of input must return `Pending`.
+//! - `poll_write` returning `Ok(0)` for a nonempty buffer is an error.
+//! - A returned `Pending` must have registered a wakeup.
+//!
+//! # Protocol
+//!
+//! Reliability is stop-and-wait in each direction independently: one
+//! unacknowledged outgoing packet and one retained incoming payload. This
+//! favors small, fixed memory over throughput.
+//!
+//! Each packet is
+//!
+//! ```text
+//! 0 | COBS(kind | session | sequence | payload | checksum) | 0
 //! ```
 //!
-//! For Tokio, the default features suffice, or select `features = ["tokio"]`
-//! explicitly. Both backends may be enabled together; their entry points
-//! remain in separate modules.
+//! with big-endian integers:
 //!
-//! The embedded backend supports `no_std`. The Tokio backend enables this
-//! crate's `std` feature. Neither backend creates an executor or spawns tasks;
-//! executor and runtime requirements depend on the supplied I/O types.
+//! | Field | Size | Meaning |
+//! |---|---|---|
+//! | `kind` | 1 | `1` for DATA, `2` for ACK. |
+//! | `session` | 8 | Session identifier from [`Config::session`]. |
+//! | `sequence` | 4 | DATA sequence number, starting at 0. An ACK echoes it. |
+//! | `payload` | 1 or more for DATA, absent for ACK | Application bytes. The length is implied by the frame boundary. |
+//! | `checksum` | 4 | CRC-32/ISO-HDLC over all preceding decoded fields. |
 //!
-//! Without a backend, the crate still exposes the synchronous [`sync`]
-//! module, size helpers, [`DecodeProgress`], and the shared error types.
+//! A receiver accepts DATA only if the session matches, the checksum is
+//! valid and the sequence is the next expected one. It acknowledges data once
+//! it has *retained* it, not once the application has read it. A repeat of
+//! the previous DATA is acknowledged again but never delivered twice. Any
+//! other DATA is dropped. A sender releases its packet only for an ACK
+//! with a matching session and sequence.
 //!
-//! # In-memory encoding and decoding
+//! The receive path collects bytes until a zero delimiter and decodes only
+//! delimiter-terminated frames. Repeated zeros are padding. A frame longer
+//! than the connection's buffer is discarded through its delimiter, and the
+//! following frame is processed normally.
 //!
-//! The [`sync`] module encodes and decodes directly between slices without
-//! asynchronous I/O. It is always available, including in `no_std` builds
-//! with `default-features = false`.
+//! # Limitations
 //!
-//! # Encoding
-//!
-//! Both backend modules provide:
-//!
-//! - `encode_from_slice_async`: encodes a complete payload as an undelimited
-//!   body. Each call produces a separate body.
-//! - `encode_from_slice_including_sentinels_async`: adds one leading and one
-//!   trailing zero delimiter around a complete body's encoding.
-//! - `CobsEncoderAsync`: combines successive payload chunks into one body.
-//!   Call `finalize_async` explicitly to complete it.
-//!
-//! Incremental encoding requires a seekable destination because it
-//! backpatches code bytes. The one-shot slice helpers write sequentially
-//! and do not require destination seeking.
-//!
-//! An empty payload encodes as `[1]`, or `[0, 1, 0]` with surrounding
-//! delimiters. A terminal full block of 254 nonzero payload bytes does not
-//! receive a redundant trailing code byte.
-//!
-//! Use [`max_encoding_length`] to size a buffer for an undelimited body.
-//! Framed encoding requires two additional bytes; use checked arithmetic
-//! when calculating sizes from untrusted or potentially large lengths.
-//!
-//! # Decoding and frame boundaries
-//!
-//! Both backend modules provide `CobsDecoderAsync` for incremental decoding
-//! and `decode_to_slice_async` for decoding one frame into a caller-provided
-//! slice. Decoding does not require seeking.
-//!
-//! `decode_to_slice_async` reads one byte at a time so that it never consumes
-//! input belonging to the next frame. For buffered sources, such as
-//! `tokio::io::BufReader` or `&[u8]`, `decode_to_slice_buffered_async` and
-//! `CobsDecoderAsync::push_buffered_async` inspect buffered input in larger
-//! steps and consume exactly through the frame's delimiter.
-//!
-//! **Input exhaustion is not frame completion for a stateful decoder.**
-//! A push stops at input exhaustion or the first delimiter completing or
-//! invalidating an active frame. The delimiter is consumed, but subsequent
-//! encoded bytes are not requested by the decoder.
-//!
-//! For an undelimited frame, the application must independently establish
-//! its boundary and call `finish_frame`. The `check_complete` method only
-//! checks structural completeness; it neither finishes the frame nor proves
-//! that the message was not truncated at a COBS block boundary.
-//!
-//! The one-shot `decode_to_slice_async` helper accepts either a completing
-//! delimiter or structurally complete EOF after a frame has started.
-//! Use the stateful decoder when the protocol requires explicit delimiter
-//! completion.
-//!
-//! Zeros while no frame is active are ignored as padding. `[1, 0]` completes
-//! a valid empty frame, whereas `[0]` does not. [`DecodeProgress`] distinguishes
-//! per-call input/output counts from the cumulative length of a completed
-//! frame.
-//!
-//! # Errors, cancellation, and recovery
-//!
-//! Codec operations do not explicitly flush or truncate destinations.
-//! Normal codec processing uses no heap allocation; user-provided I/O,
-//! executors, and backend error construction may allocate.
-//!
-//! Operations are not transactional. Errors and cancellation can leave input
-//! consumed and output partially written. Dropping an unpolled future has
-//! no effect. Cancelling a polled, unfinished stateful operation leaves the
-//! encoder or decoder poisoned, even if individual I/O operations are
-//! cancellation-safe.
-//!
-//! Encoder `reset_async` establishes a new output boundary. Decoder
-//! `discard_frame_async` consumes input through the next delimiter.
-//! Recovery does not undo earlier I/O or resume the abandoned frame.
-//!
-//! [`DecodeError::InvalidFrame`] is different from an I/O failure: the invalid
-//! frame's delimiter has already been consumed and framing reset. Another
-//! push can process the next frame without discarding first.
-//!
-//! [`EncodeError`] and [`DecodeError`] preserve backend error types through
-//! their generic parameters. [`CompletionError`] describes failures to check
-//! or explicitly finish decoder state. [`SeekableError`] represents
-//! slice-buffer bounds errors in APIs that expose it.
-//!
-//! # Additional features
-//!
-//! | Feature | Effect |
-//! |---|---|
-//! | `std` | Enables standard-library integration for the embedded I/O dependency when it is also enabled. Does not select a backend. |
-//! | `serde` | Enables serialization and deserialization of progress and error types, subject to their generic parameter bounds. Encoder and decoder state is not serializable. |
-//! | `defmt` | Enables compact diagnostic formatting for supported types. See individual types for implementations and bounds. |
-//!
-//! There is no separate `alloc` feature. Shared error types implement
-//! [`core::error::Error`] without requiring `std`, subject to applicable
-//! generic bounds.
+//! - Both peers must be constructed with the same session identifier, chosen
+//!   by the caller and fresh for each session. It distinguishes sessions; it
+//!   is not authentication.
+//! - There is no handshake or reconnection. Peer restarts, and packets
+//!   delayed beyond a session, are outside the failure model. Sequence
+//!   numbers alone do not handle them.
+//! - Sequence numbers do not wrap. After 2<sup>32</sup> packets in one
+//!   direction the connection fails with
+//!   [`ConnectionError::SequenceExhausted`]; start a new session.
+//! - A peer that stops reading for longer than the retransmission budget
+//!   (`retransmit_timeout * (max_retries + 1)`) causes the sender to fail
+//!   with [`ConnectionError::Timeout`].
+//! - Each accepted write becomes its own packet. Small writes are not
+//!   coalesced.
+//! - There is no sliding window, adaptive timeout or fragmentation metadata.
 //!
 //! # Example
 //!
-//! Encode and decode a delimited frame using the `embedded-io` backend.
-//! The buffers are fixed-size; `futures` supplies the host executor for this
-//! example only.
+//! The stubs below stand in for a real link and clock. A real
+//! [`Timer::poll_deadline`] must register `cx.waker()` when the deadline is
+//! in the future.
 //!
 //! ```
-//! # #[cfg(feature = "embedded-io")]
-//! # {
-//! use cobs_io_async::{
-//!     embedded::{
-//!         decode_to_slice_async,
-//!         encode_from_slice_including_sentinels_async,
-//!     },
-//!     max_encoding_length,
-//! };
+//! # use core::convert::Infallible;
+//! # use core::task::{Context, Poll, Waker};
+//! use cobs_io_async::{Config, Reliable, Timer, Transport};
 //!
-//! # futures::executor::block_on(async {
-//! let payload = [7, 0, 8];
-//! let mut encoded = [0u8; max_encoding_length(3) + 2];
-//!
-//! let encoded_len = {
-//!     let mut writer = &mut encoded[..];
-//!     encode_from_slice_including_sentinels_async(&payload, &mut writer)
-//!         .await
-//!         .unwrap()
-//! };
-//!
-//! assert_eq!(&encoded[..encoded_len as usize], &[0, 2, 7, 2, 8, 0]);
-//!
-//! let mut reader = &encoded[..encoded_len as usize];
-//! let mut decoded = [0u8; 3];
-//! let decoded_len = decode_to_slice_async(&mut reader, &mut decoded)
-//!     .await
-//!     .unwrap();
-//!
-//! assert_eq!(decoded_len, payload.len() as u64);
-//! assert_eq!(decoded, payload);
-//! assert!(reader.is_empty());
-//! # });
+//! # struct Link;
+//! # impl Transport for Link {
+//! #     type Error = Infallible;
+//! #     fn poll_read(&mut self, _: &mut Context<'_>, _: &mut [u8]) -> Poll<Result<usize, Infallible>> {
+//! #         Poll::Pending
+//! #     }
+//! #     fn poll_write(&mut self, _: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Infallible>> {
+//! #         Poll::Ready(Ok(buf.len()))
+//! #     }
+//! #     fn poll_flush(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+//! #         Poll::Ready(Ok(()))
+//! #     }
 //! # }
+//! # struct Clock(u64);
+//! # impl Timer for Clock {
+//! #     fn now(&self) -> u64 {
+//! #         self.0
+//! #     }
+//! #     fn poll_deadline(&mut self, _: &mut Context<'_>, deadline: u64) -> Poll<()> {
+//! #         if self.0 >= deadline { Poll::Ready(()) } else { Poll::Pending }
+//! #     }
+//! # }
+//! let mut connection: Reliable<Link, Clock> =
+//!     Reliable::new(Link, Clock(0), Config::new(0xC0B5)).unwrap();
+//! let mut cx = Context::from_waker(Waker::noop());
+//!
+//! assert!(matches!(connection.poll_write(&mut cx, b"hello"), Poll::Ready(Ok(5))));
+//! // The peer has not acknowledged the packet, so the flush stays pending.
+//! assert!(connection.poll_flush(&mut cx).is_pending());
 //! ```
 //!
-//! # Protocol limitations
+//! # In-memory encoding and decoding
 //!
-//! COBS provides framing, not integrity or authenticity. A structurally valid
-//! frame may still contain corrupted or truncated application data. Add an
-//! appropriate checksum, authentication mechanism, or independently known
-//! message length when the protocol requires it.
+//! The [`sync`] module exposes the underlying COBS codec between slices. It
+//! needs no allocation and is independent of [`Reliable`].
+//!
+//! COBS transforms a payload into an encoded body containing no zero bytes,
+//! so zero can delimit frames. Payload zeros are encoded as data. An empty
+//! payload encodes as `[1]`, or `[0, 1, 0]` with surrounding delimiters. A
+//! terminal full block of 254 nonzero payload bytes does not receive a
+//! redundant trailing code byte.
+//!
+//! Use [`max_encoding_length`] to size a buffer for an undelimited body, and
+//! reserve two more bytes for delimiters, using checked arithmetic when sizes
+//! come from untrusted or potentially large lengths.
+//!
+//! COBS alone provides framing, not integrity or authenticity.
+//!
+//! # Features
+//!
+//! No features are enabled by default.
+//!
+//! | Feature | Effect |
+//! |---|---|
+//! | `serde` | Serialization and deserialization of [`Config`], [`ConfigError`], [`ConnectionError`], [`DecodeError`], [`SeekableError`] and [`DecodeProgress`], subject to generic parameter bounds. Live connection state is not serializable. |
+//! | `defmt` | Compact diagnostic formatting for the same types. |
+//!
+//! The crate is `no_std` and never allocates.
 
-#![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(docsrs, feature(doc_cfg))]
+#![no_std]
 #![warn(missing_docs)]
 
 #[cfg(test)]
 extern crate std;
 
-#[cfg(any(feature = "embedded-io", feature = "tokio"))]
-pub use codec::DEFAULT_BUF_SIZE;
 pub use codec::decode::DecodeProgress;
-pub use error::{CodecError, CompletionError, DecodeError, EncodeError, SeekableError};
 
 mod codec;
+pub(crate) mod connection;
 mod error;
+mod protocol;
+mod timer;
+mod transport;
 
 pub mod sync;
 
+pub use connection::{Config, Reliable};
+pub use error::{ConfigError, ConnectionError, DecodeError, SeekableError};
+pub use timer::Timer;
+pub use transport::Transport;
+
 #[cfg(test)]
 mod tests;
-
-#[cfg(feature = "embedded-io")]
-#[cfg_attr(docsrs, doc(cfg(feature = "embedded-io")))]
-pub mod embedded;
-
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
-pub mod tokio;
 
 /// Returns the maximum additional bytes needed for an undelimited encoding.
 ///

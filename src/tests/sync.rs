@@ -1,3 +1,4 @@
+use core::convert::Infallible;
 use std::{vec, vec::Vec};
 
 use crate::sync::{
@@ -200,10 +201,6 @@ fn encode_reports_insufficient_capacity() {
         );
     }
     assert_eq!(
-        encode_from_slice(&[], &mut []),
-        Err(SeekableError::OutOfBounds)
-    );
-    assert_eq!(
         encode_from_slice_including_sentinels(&[], &mut []),
         Err(SeekableError::OutOfBounds)
     );
@@ -213,25 +210,15 @@ fn encode_reports_insufficient_capacity() {
 fn decode_skips_padding_and_stops_at_delimiter() {
     let source = [0, 0, 2, 9, 0, 2, 7, 0];
     let mut dest = [0x55; 3];
-    let frame = decode_to_slice(&source, &mut dest).unwrap();
-    assert_eq!(
-        frame,
-        DecodedFrame {
-            len: 1,
-            consumed: 5
-        }
-    );
-    assert_eq!(dest, [9, 0x55, 0x55]);
-
-    let frame = decode_to_slice(&source[frame.consumed..], &mut dest).unwrap();
-    assert_eq!(
-        frame,
-        DecodedFrame {
-            len: 1,
-            consumed: 3
-        }
-    );
-    assert_eq!(dest[0], 7);
+    let mut offset = 0;
+    for (payload, consumed) in [(9, 5), (7, 3)] {
+        let frame = decode_to_slice(&source[offset..], &mut dest).unwrap();
+        assert_eq!(frame, DecodedFrame { len: 1, consumed });
+        assert_eq!(dest, [payload, 0x55, 0x55]);
+        offset += frame.consumed;
+        dest = [0x55; 3];
+    }
+    assert_eq!(offset, source.len());
 }
 
 #[test]
@@ -270,23 +257,20 @@ fn decode_rejects_malformed_frames() {
 #[test]
 fn decode_rejects_truncated_and_empty_input() {
     let mut dest = [0; 300];
-    assert_eq!(
-        decode_to_slice(&[3, 1], &mut dest),
-        Err(DecodeError::UnexpectedSourceEof)
-    );
-    let truncated_full_block = &encode_vec(&nonzero(254))[..200];
-    assert_eq!(
-        decode_to_slice(truncated_full_block, &mut dest),
-        Err(DecodeError::UnexpectedSourceEof)
-    );
-    assert_eq!(
-        decode_to_slice(&[], &mut dest),
-        Err(DecodeError::EmptyFrame)
-    );
-    assert_eq!(
-        decode_to_slice(&[0, 0], &mut dest),
-        Err(DecodeError::EmptyFrame)
-    );
+    let truncated_full_block = encode_vec(&nonzero(254))[..200].to_vec();
+    let cases: [(&str, &[u8], DecodeError<Infallible, SeekableError>); 4] = [
+        ("truncated block", &[3, 1], DecodeError::UnexpectedSourceEof),
+        (
+            "truncated full block",
+            &truncated_full_block,
+            DecodeError::UnexpectedSourceEof,
+        ),
+        ("empty", &[], DecodeError::EmptyFrame),
+        ("padding only", &[0, 0], DecodeError::EmptyFrame),
+    ];
+    for (name, source, error) in cases {
+        assert_eq!(decode_to_slice(source, &mut dest), Err(error), "{name}");
+    }
 
     // Truncation at a block boundary is structurally indistinguishable from
     // a complete undelimited frame, as documented.
@@ -319,37 +303,5 @@ fn decode_reports_insufficient_capacity() {
             decode_to_slice(&encoded, &mut short),
             Err(DecodeError::Destination(SeekableError::OutOfBounds))
         );
-    }
-}
-
-#[cfg(feature = "embedded-io")]
-#[test]
-fn matches_embedded_backend() {
-    let mut rng = XorShift(7);
-    for len in [0, 1, 253, 254, 255, 509, 1200] {
-        let data = rng.payload(len, 20);
-        let mut async_buf = vec![0; max_encoding_length(len)];
-        let async_len = {
-            let mut writer = &mut async_buf[..];
-            futures::executor::block_on(crate::embedded::encode_from_slice_async(
-                &data,
-                &mut writer,
-            ))
-            .unwrap() as usize
-        };
-        assert_eq!(&async_buf[..async_len], encode_vec(&data).as_slice());
-    }
-}
-
-#[cfg(feature = "tokio")]
-#[test]
-fn matches_tokio_backend() {
-    let mut rng = XorShift(11);
-    for len in [0, 1, 253, 254, 255, 509, 1200] {
-        let data = rng.payload(len, 20);
-        let mut async_buf = Vec::new();
-        futures::executor::block_on(crate::tokio::encode_from_slice_async(&data, &mut async_buf))
-            .unwrap();
-        assert_eq!(async_buf, encode_vec(&data));
     }
 }

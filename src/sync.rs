@@ -1,9 +1,9 @@
 //! Synchronous COBS encoding and decoding between in-memory slices.
 //!
-//! This module is always available, including with
-//! `default-features = false` and in `no_std` builds. It needs no backend
-//! feature, executor, or heap allocation, and uses the same framing rules
-//! as the asynchronous backends.
+//! This module is always available, including in `no_std` builds. It needs
+//! no executor or heap allocation. [`Reliable`](crate::Reliable) uses the
+//! same framing rules internally, but accepts only delimiter-terminated
+//! frames.
 //!
 //! | Operation | API |
 //! |---|---|
@@ -41,8 +41,7 @@
 
 use core::convert::Infallible;
 
-use crate::codec::decode::SliceFrameDecoder;
-use crate::codec::encode::{EncoderState, PushResult};
+use crate::codec::decode::decode_slice;
 use crate::{DecodeError, SeekableError};
 
 /// Result of successfully decoding one frame with [`decode_to_slice`].
@@ -85,7 +84,8 @@ pub struct DecodedFrame {
 /// ```
 pub fn encode_from_slice(source: &[u8], dest: &mut [u8]) -> Result<usize, SeekableError> {
     let mut output = SliceOutput { dest, len: 0 };
-    let mut state = EncoderState::default();
+    let mut code_idx = 0;
+    let mut code = 1u8;
     let mut needs_code_placeholder = false;
     output.append(0)?;
     for &byte in source {
@@ -93,22 +93,26 @@ pub fn encode_from_slice(source: &[u8], dest: &mut [u8]) -> Result<usize, Seekab
             output.append(0)?;
             needs_code_placeholder = false;
         }
-        match state.push(byte).ok_or(SeekableError::OutOfBounds)? {
-            PushResult::AddSingle(byte) => output.append(byte)?,
-            PushResult::ModifyFromStartAndSkip((idx, code)) => {
-                output.set(idx, code)?;
-                output.append(0)?;
-            }
-            PushResult::ModifyFromStartAndPushAndSkip((idx, code, byte)) => {
-                output.set(idx, code)?;
-                output.append(byte)?;
-                needs_code_placeholder = true;
-            }
+        if byte == 0 {
+            output.set(code_idx, code)?;
+            code_idx = output.len;
+            output.append(0)?;
+            code = 1;
+            continue;
+        }
+        code += 1;
+        if code == u8::MAX {
+            output.set(code_idx, code)?;
+            output.append(byte)?;
+            code_idx = output.len;
+            code = 1;
+            needs_code_placeholder = true;
+        } else {
+            output.append(byte)?;
         }
     }
     if !needs_code_placeholder {
-        let (idx, code) = state.finalize();
-        output.set(idx, code)?;
+        output.set(code_idx, code)?;
     }
     Ok(output.len)
 }
@@ -162,8 +166,8 @@ pub fn encode_from_slice_including_sentinels(
 ///   incomplete block.
 /// - [`DecodeError::EmptyFrame`]: `source` is empty or contains only padding.
 ///
-/// Errors may leave `dest` partially overwritten. Source and poisoning errors
-/// are never returned.
+/// Errors may leave `dest` partially overwritten. Source errors are never
+/// returned.
 ///
 /// # Example
 ///
@@ -182,17 +186,7 @@ pub fn decode_to_slice(
     source: &[u8],
     dest: &mut [u8],
 ) -> Result<DecodedFrame, DecodeError<Infallible, SeekableError>> {
-    let mut decoder = SliceFrameDecoder::new(dest);
-    let (consumed, status) = decoder.push(source);
-    let len = match decoder.outcome(status, || SeekableError::OutOfBounds) {
-        Some(result) => result?,
-        None => decoder.finish_at_eof()?,
-    };
-    Ok(DecodedFrame {
-        // The decoded length never exceeds `dest.len()`.
-        len: len as usize,
-        consumed,
-    })
+    decode_slice(source, dest)
 }
 
 struct SliceOutput<'a> {
@@ -212,12 +206,8 @@ impl SliceOutput<'_> {
     }
 
     #[inline]
-    fn set(&mut self, idx: u64, byte: u8) -> Result<(), SeekableError> {
-        let slot = usize::try_from(idx)
-            .ok()
-            .and_then(|idx| self.dest.get_mut(idx))
-            .ok_or(SeekableError::OutOfBounds)?;
-        *slot = byte;
+    fn set(&mut self, idx: usize, byte: u8) -> Result<(), SeekableError> {
+        *self.dest.get_mut(idx).ok_or(SeekableError::OutOfBounds)? = byte;
         Ok(())
     }
 }

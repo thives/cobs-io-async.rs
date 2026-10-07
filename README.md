@@ -10,19 +10,23 @@
 > [!CAUTION]
 > This crate is not yet production-ready. It has not been widely tested and may contain bugs.
 
-Asynchronous [Consistent Overhead Byte Stuffing (COBS)](https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing)
-encoding and decoding for embedded and Tokio I/O.
+A runtime-independent, `no_std` reliable byte-stream transport for unreliable
+point-to-point links, built on
+[Consistent Overhead Byte Stuffing (COBS)](https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing)
+framing.
 
-COBS transforms a payload into an encoded body containing no zero bytes,
-allowing zero to mark frame boundaries in a byte stream. This crate uses
-zero as its fixed delimiter; payload zeros are encoded as data.
+`Reliable` implements a poll-based `Transport` trait. Applications write and
+read bytes; the connection divides them into packets, frames and checksums
+them, acknowledges them, retransmits lost ones, and delivers them in order.
+Packet boundaries are invisible.
 
-- Independent `embedded-io-async` and Tokio backends.
-- `no_std` support through the embedded backend.
-- Synchronous slice-to-slice encoding and decoding, available without any backend.
-- One-shot helpers and stateful, incremental codecs.
-- No heap allocation for normal codec processing.
-- Explicit frame completion and recovery after interrupted operations.
+- No runtime dependency: you supply a `Transport` for your link and a `Timer`
+  for your clock. The crate provides no runtime adapters and spawns no tasks.
+- Fixed memory, no heap allocation, `no_std`.
+- Stop-and-wait reliability in each direction, with CRC-32 integrity checking.
+- Corrupted, truncated and oversized frames are discarded and recovered by
+  retransmission.
+- Synchronous slice-to-slice COBS encoding and decoding in `sync`.
 
 The package name is `cobs-io-async`; its Rust import name is `cobs_io_async`.
 
@@ -30,47 +34,115 @@ The package name is `cobs-io-async`; its Rust import name is `cobs_io_async`.
 
 ## Installation
 
-`tokio` and `serde` features are enabled by default. Select the backend matching your I/O
-types.
-
-The examples below use the latest published release. Use `0.0.x` versions
-exactly as shown: Cargo treats `0.0.x` requirements as exact.
-
-### Embedded I/O
+The reliable transport is not yet in a published release. Until then, depend
+on the repository:
 
 ```toml
 [dependencies]
-cobs-io-async = { version = "0.0.2", default-features = false, features = ["embedded-io"] }
+cobs-io-async = { git = "https://github.com/thives/cobs-io-async.rs" }
 ```
 
-Use `cobs_io_async::embedded` with the traits from `embedded_io_async`.
-This backend supports `no_std` and does not require a particular executor.
+No features are enabled by default.
 
-### Tokio
+## Usage
 
-```toml
-[dependencies]
-cobs-io-async = { version = "0.0.2", features = ["tokio"] }
+Implement the two traits for your platform:
+
+```rust
+pub trait Transport {
+    type Error;
+
+    fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize, Self::Error>>;
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>>;
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+}
+
+pub trait Timer {
+    fn now(&self) -> u64;
+    fn poll_deadline(&mut self, cx: &mut Context<'_>, deadline: u64) -> Poll<()>;
+}
 ```
 
-Use `cobs_io_async::tokio` with Tokio's asynchronous I/O traits.
-Enable any additional Tokio features required by your application in its
-own Tokio dependency.
+Then wrap them. Both peers must use the same session identifier:
 
-The crate does not create a runtime or spawn tasks. Runtime requirements
-depend on the supplied I/O types.
+```rust
+use cobs_io_async::{Config, Reliable};
 
-Both backends may be enabled together. Their APIs remain in separate
-modules.
+let config = Config {
+    session: 0xC0B5,
+    retransmit_timeout: 200, // in Timer ticks
+    max_retries: 8,
+};
+let mut connection: Reliable<MyLink, MyClock> =
+    Reliable::new(link, clock, config).unwrap();
+```
 
-### In-memory only
+`connection` is itself a `Transport`. Wrap it in your runtime's I/O traits, or
+poll it directly. Adapters are yours to write because pinning, `Send` and
+executor requirements differ between runtimes.
 
-The synchronous `cobs_io_async::sync` module needs no asynchronous backend
-and supports `no_std`. When it is all you need, set
-`default-features = false` without selecting a backend feature.
+**The connection makes progress only while polled.** Every `poll_read`,
+`poll_write` and `poll_flush` drives both directions. While none is pending,
+call `Reliable::poll_progress` from a task of your own so acknowledgments and
+retransmissions keep flowing. It returns `Ready` only with the error that
+terminated the connection.
 
-The `sync` module was added after the `0.0.2` release and is available in
-the next published version.
+## Behavior
+
+| Operation | Behavior |
+|---|---|
+| `poll_write(buf)` | Accepts at most `Reliable::MAX_PAYLOAD` bytes of `buf` and returns the count. Returns `Pending` while the previous packet is unacknowledged. |
+| `poll_read(buf)` | Copies verified payload bytes. Returns `Pending` when none are available. |
+| `poll_flush()` | Completes when all accepted data is acknowledged and the underlying transport is flushed. |
+| Empty buffer | Returns `Ready(Ok(0))`; creates no packet. |
+| Corrupted or malformed frame | Discarded; retransmission recovers. |
+| Receive slot full | New data is not acknowledged, so the peer retransmits it. |
+| Transport error, EOF, exhausted retries or sequence numbers | The connection fails permanently with a `ConnectionError`. |
+| Dropped future | Harmless; all state is owned by the connection. |
+
+The underlying transport must report end of stream as `Ok(0)` from
+`poll_read` with a nonempty buffer, and temporary lack of input as `Pending`.
+
+Each poll method does a bounded amount of work, and wakes the task itself if
+work remains, so an always-ready transport cannot monopolize an executor.
+
+### Capacity
+
+`Reliable<T, C, N>` takes the size `N` (default 256) of each internal frame
+buffer, bounding a complete encoded packet including delimiters. The usable
+payload per packet is `Reliable::MAX_PAYLOAD` (236 for the default). `N` must
+be at least 21. The connection holds four buffers of `N` bytes plus a small
+ACK buffer.
+
+### Wire format
+
+```text
+0 | COBS(kind | session | sequence | payload | checksum) | 0
+```
+
+Integers are big-endian. `kind` is `1` (DATA) or `2` (ACK), `session` is 8
+bytes, `sequence` is 4 bytes, DATA has at least one payload byte and ACK none,
+and `checksum` is CRC-32/ISO-HDLC over the preceding fields. A receiver
+acknowledges data once it has retained it, not once the application has read
+it, and never delivers a retransmitted duplicate twice.
+
+### Limitations
+
+- Both peers must be constructed with the same session identifier, fresh for
+  each session. It is not authentication.
+- There is no handshake or reconnection. Peer restarts and packets delayed
+  beyond a session are not handled.
+- Sequence numbers do not wrap. After 2^32 packets in one direction the
+  connection fails with `ConnectionError::SequenceExhausted`.
+- A peer that stops reading for longer than
+  `retransmit_timeout * (max_retries + 1)` makes the sender fail with
+  `ConnectionError::Timeout`.
+- Each accepted write becomes its own packet; there is no coalescing, sliding
+  window or adaptive timeout.
+
+## In-memory COBS
+
+The `sync` module encodes and decodes between slices without allocation:
 
 ```rust
 use cobs_io_async::{max_encoding_length, sync};
@@ -87,178 +159,24 @@ fn main() {
 }
 ```
 
-## Quick start
-
-This example encodes a payload with surrounding delimiters, then decodes it
-into a fixed-size buffer.
-
-It uses the embedded backend and `futures` as a host-side executor. To run it,
-also add this under `[dependencies]`:
-
-```toml
-futures = "0.3"
-```
-
-```rust
-use cobs_io_async::{
-    embedded::{
-        decode_to_slice_async,
-        encode_from_slice_including_sentinels_async,
-    },
-    max_encoding_length,
-};
-
-fn main() {
-    futures::executor::block_on(async {
-        let payload = [7, 0, 8];
-        let mut encoded = [0u8; max_encoding_length(3) + 2];
-
-        let encoded_len = {
-            let mut writer = &mut encoded[..];
-            encode_from_slice_including_sentinels_async(&payload, &mut writer)
-                .await
-                .unwrap()
-        };
-
-        assert_eq!(
-            &encoded[..encoded_len as usize],
-            &[0, 2, 7, 2, 8, 0],
-        );
-
-        let mut reader = &encoded[..encoded_len as usize];
-        let mut decoded = [0u8; 3];
-
-        let decoded_len = decode_to_slice_async(&mut reader, &mut decoded)
-            .await
-            .unwrap();
-
-        assert_eq!(decoded_len, payload.len() as u64);
-        assert_eq!(decoded, payload);
-        assert!(reader.is_empty());
-    });
-}
-```
-
-For this in-memory example, the Tokio backend can be used by selecting the
-`tokio` feature and changing the import from `embedded` to `tokio`.
-Slice I/O does not itself require a Tokio runtime.
-
-`futures` is only the executor chosen for this example, not a requirement of
-the codec.
-
-## Choosing an API
-
-Both backend modules expose the same entry-point names:
-
-| API | Purpose |
-|---|---|
-| `encode_from_slice_async` | Encode one complete payload without delimiters. |
-| `encode_from_slice_including_sentinels_async` | Encode one complete payload with leading and trailing zero delimiters. |
-| `CobsEncoderAsync` | Combine successive payload chunks into one encoded body; finish with `finalize_async`. |
-| `decode_to_slice_async` | Decode one frame into a caller-provided slice, reading one byte at a time. |
-| `decode_to_slice_buffered_async` | Decode one frame from a buffered source (`BufRead` / `AsyncBufRead`), consuming exactly through the delimiter. |
-| `CobsDecoderAsync` | Retain decoding state across successive input chunks. `push_buffered_async` batches reads and writes from a buffered source. |
-
-The `sync` module provides `encode_from_slice`,
-`encode_from_slice_including_sentinels`, and `decode_to_slice` for data
-already in memory.
-
-`decode_to_slice_async` never consumes input after the frame delimiter, so
-it must read one byte per call from a plain `Read` or `AsyncRead` source.
-Prefer `decode_to_slice_buffered_async` or
-`CobsDecoderAsync::push_buffered_async` with a buffered source, such as
-`tokio::io::BufReader` or `&[u8]`, to batch reads without losing bytes from
-the next frame.
-
-Incremental encoding requires a seekable destination because it backpatches
-earlier code bytes. One-shot slice encoding writes sequentially and does not
-require destination seeking. Decoding never requires seeking.
-
-The crate root exposes the `sync` module, shared error types,
-`DecodeProgress`, `max_encoding_overhead`, and `max_encoding_length`, even
-when no backend is enabled.
-
-`embedded_io_async::Write` is implemented for the embedded backend's `CobsEncoderAsync` and `CobsDecoderAsync`.
-
-See the module documentation for backend-specific bounds and error behavior:
-
-- [Embedded backend](https://docs.rs/cobs-io-async/latest/cobs_io_async/embedded/)
-- [Tokio backend](https://docs.rs/cobs-io-async/latest/cobs_io_async/tokio/)
-
-## Framing and buffer sizes
-
 An empty payload encodes as `[1]`, or `[0, 1, 0]` with surrounding delimiters.
-Zeros outside an active frame are padding, so `[0]` is not a completed empty
-frame.
+Zeros outside an active frame are padding. Use `max_encoding_length` for an
+upper bound on an undelimited body, reserve two more bytes for delimiters, and
+use checked arithmetic for potentially large lengths.
 
-Use `max_encoding_length(payload_len)` for an upper bound on an undelimited
-body's size. Reserve two additional bytes for surrounding delimiters.
-Use checked arithmetic when calculating sizes from potentially large lengths.
+`sync::decode_to_slice` also accepts a structurally complete frame at end of
+input. That cannot detect truncation at a COBS block boundary, so check that
+`consumed` includes a delimiter when your protocol requires one. `Reliable`
+never uses that behavior.
 
-Decoder capacity is based on the decoded payload, not the encoded length.
-Successful one-shot decoding leaves the unused destination tail unchanged.
-
-### Input exhaustion is not frame completion
-
-A stateful decoder push stops when input is exhausted or when a delimiter
-completes or invalidates the active frame.
-
-- Exhausting an input chunk does not finish the frame.
-- `check_complete` checks structural completeness without finishing it.
-- `finish_frame` declares an independently known undelimited boundary.
-- `DecodeProgress::frame_len == Some(n)` reports a frame completed by a
-  delimiter during that push, including `Some(0)` for an empty payload.
-
-The one-shot `decode_to_slice_async` helper also accepts structurally complete
-EOF after a frame has started. Structural completeness cannot detect
-truncation exactly at a COBS block boundary. Use the stateful decoder when
-the protocol requires explicit delimiter completion.
-
-## Errors, cancellation, and recovery
-
-Codec operations do not explicitly flush or truncate destinations. Errors
-and cancellation may leave input consumed and output partially written;
-operations are not transactional.
-
-Dropping an unpolled future has no effect. Cancelling a polled, unfinished
-stateful operation leaves the encoder or decoder poisoned.
-
-- Encoder `reset_async` abandons the current body and establishes a new
-  output boundary.
-- Decoder `discard_frame_async` consumes input through the next zero
-  delimiter and clears poisoning only on success.
-- Recovery does not roll back output or resume the abandoned frame.
-
-`DecodeError::InvalidFrame` is different from an I/O failure: the bad frame's
-delimiter has already been consumed and framing reset. Another push can
-process the next frame without discarding first.
-
-A cancelled read may already have consumed the intended recovery delimiter.
-Consult the recovery-method documentation before retrying.
-
-Normal codec processing does not allocate, but user-provided I/O, executors,
-and backend error construction may allocate.
+COBS provides framing, not integrity or authenticity.
 
 ## Features
 
 | Feature | Effect |
 |---|---|
-| `embedded-io` | Enables the embedded backend; supports `no_std`. |
-| `tokio` | Enables the Tokio backend and this crate's `std` feature. |
-| `std` | Enables standard-library integration for the embedded I/O dependency when it is also enabled. Does not select a backend. |
-| `serde` | Adds serialization and deserialization for progress and error types, subject to generic parameter bounds. |
-| `defmt` | Adds compact diagnostic formatting for supported types. |
-
-There is no separate `alloc` feature. Encoder and decoder state is not
-serializable.
-
-## Protocol limitations
-
-COBS provides framing, not integrity or authenticity. A structurally valid
-frame may still contain corrupted or truncated application data.
-
-Use an appropriate checksum, authentication mechanism, or independently
-known message length when your protocol requires it.
+| `serde` | Serialization of `Config`, `ConfigError`, `ConnectionError`, `DecodeError`, `SeekableError` and `DecodeProgress`, subject to generic bounds. Live connection state is not serializable. |
+| `defmt` | Compact diagnostic formatting for the same types. |
 
 ## Development
 
@@ -275,13 +193,11 @@ just docs
 `just test` requires [cargo-nextest](https://nexte.st/).
 The documentation recipe requires a nightly Rust toolchain.
 
-Library tests can also be run directly with Cargo:
+Tests can also be run directly with Cargo:
 
 ```sh
-cargo test --lib --no-default-features
-cargo test --lib --no-default-features --features embedded-io
-cargo test --lib --no-default-features --features tokio
-cargo test --lib --all-features
+cargo test --no-default-features
+cargo test --all-features
 ```
 
 ## License

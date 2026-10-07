@@ -1,35 +1,28 @@
 [package]
 name = "cobs-io-async"
-version = "0.0.3"
+version = "0.0.4"
 authors = [
   "Thomas Ivesdal-Tronstad <>",
 ]
 license = "MIT OR Apache-2.0"
-description = "Asynchronous COBS encoding and decoding for embedded-io-async and Tokio, with no_std support and incremental framing."
+description = "Runtime-independent reliable byte-stream transport over COBS framing for unreliable point-to-point links, with no_std support."
 repository = "https://github.com/thives/cobs-io-async.rs"
-keywords = ["cobs", "codec", "io", "encoding", "async"]
+keywords = ["cobs", "framing", "reliable", "transport", "no-std"]
 edition = "2024"
 rust-version = "1.87"
 
 [features]
-default = ["tokio", "serde"]
-embedded-io = ["dep:embedded-io-async"]
-std = ["embedded-io-async?/std"]
-tokio = ["std","dep:tokio", "dep:futures"]
+default = []
 serde = ["dep:serde"]
-defmt = ["dep:defmt", "embedded-io-async?/defmt"]
+defmt = ["dep:defmt"]
 
 [dependencies]
 defmt = { version = "1", optional = true }
 serde = { version = "1", default-features = false, features = ["derive"], optional = true }
-embedded-io-async = { version = "0.7", default-features = false, optional = true }
-tokio = { version = "1.53", default-features = false, features = ["io-util"], optional = true }
-futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8" }
 rand = "0.10"
-futures = "0.3"
 
 [[bench]]
 name = "main"

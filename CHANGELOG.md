@@ -10,26 +10,37 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 
+- `Reliable`, a runtime-independent reliable byte-stream connection over COBS
+  framing. It implements the new `Transport` trait using stop-and-wait
+  acknowledgments, CRC-32 integrity checking, retransmission and receive
+  backpressure, and drives both directions from every poll method.
+- `Transport`, a poll-based byte-stream trait (`poll_read`, `poll_write`,
+  `poll_flush`), and `Timer`, a monotonic clock with deadline wakeups. Users
+  implement both for their platform.
+- `Config` (session identifier, retransmission timeout, retry limit),
+  `ConfigError` and `ConnectionError`.
+- `Reliable::poll_progress` to maintain a connection while no read, write or
+  flush is pending.
 - `sync` module with `encode_from_slice`, `encode_from_slice_including_sentinels`,
-  and `decode_to_slice` for in-memory encoding and decoding. Available without
-  any backend feature, including in `no_std` builds.
-- `decode_to_slice_buffered_async` in the `embedded` and `tokio` backends,
-  which batches reads from `BufRead` / `AsyncBufRead` sources while consuming
-  input only through the frame delimiter.
-- `CobsDecoderAsync::push_buffered_async` (and the `CobsDecoderSliceAsync`
-  wrapper), which batches reads from buffered sources and writes decoded
-  output in batches, consuming a frame's delimiter only after its output is
-  acknowledged.
+  and `decode_to_slice` for in-memory encoding and decoding.
 
 ### Changed
 
-- `DecodeProgress` and the shared error types are now available with
-  `default-features = false`, as previously documented.
+- **Breaking:** the crate is now a transport layer rather than an asynchronous
+  codec. The default features are empty and the crate is `no_std`.
+- `DecodeError` no longer has a `Poisoned` variant, and
+  `DecodeProgress` now describes only the progress carried by
+  `DecodeError::InvalidFrame`.
 
-### Fixed
+### Removed
 
-- Documentation now states that `tokio` and `serde` are enabled by default,
-  and dependency examples reference the published `0.0.2` release instead of `0.1`.
+- **Breaking:** the `embedded` and `tokio` modules and the `embedded-io`,
+  `tokio` and `std` features, together with their encoders, decoders and
+  I/O trait implementations. Runtime adapters are expected to be implemented
+  by users against `Transport` and `Timer`.
+- `CompletionError`, `EncodeError`, `CodecError`, `DEFAULT_BUF_SIZE`, and the
+  `embedded_io_async` error implementations.
+- The `futures` dev-dependency.
 
 # [v0.1.0] 2026-09-14
 

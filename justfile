@@ -11,21 +11,19 @@ check:
 
 embedded:
   cargo build --target thumbv7em-none-eabihf --no-default-features
+  cargo build --target thumbv7em-none-eabihf --all-features
 
 test:
-  cargo nextest r --features embedded-io
-  cargo nextest r --features tokio
+  cargo nextest r --no-default-features
   cargo nextest r --all-features
-  cargo test --doc --features embedded-io
-  cargo test --doc --features tokio
-  cargo test --doc
+  cargo test --doc --no-default-features
+  cargo test --doc --all-features
 
 build:
   cargo build --all-features
 
 docs:
-  RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --features embedded-io
-  RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --features tokio
+  RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --no-default-features
   RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --all-features
 
 docs-html:
