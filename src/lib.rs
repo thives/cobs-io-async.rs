@@ -43,12 +43,34 @@
 //! | Corrupted or malformed frame | Discarded silently. Retransmission provides recovery. |
 //! | Incoming payload slot full | New DATA is discarded without acknowledgment, so the peer retransmits it. Acknowledgments and duplicates are still processed. |
 //! | Transport error, EOF, retries exhausted, sequence numbers exhausted | The connection fails permanently. See [`ConnectionError`]. |
-//! | Dropping a future awaiting a poll method | Harmless. All protocol state is owned by the connection. |
+//! | Dropping a future awaiting a poll method | Protocol state and accepted data are unaffected. Multi-task adapters must call [`Reliable::cancel_pending`] to preserve the other operations' wakeups. |
 //!
 //! Every poll method drives both directions, performing a bounded amount of
 //! work per call. If work remains when the budget is spent, the task is woken
 //! before `Pending` is returned, so an always-ready transport cannot
 //! monopolize the executor.
+//!
+//! # Cancellation
+//!
+//! The connection owns all protocol state, so dropping a future never rolls
+//! it back or corrupts accepted data. It does not detect the drop, however.
+//! The underlying [`Transport`] and [`Timer`] wake only their latest poller,
+//! so if the task that polled them last is canceled, another pending task may
+//! never be woken.
+//!
+//! An adapter that polls operations from separate tasks must therefore:
+//!
+//! 1. Record which operation, as a [`PendingOperation`], returned `Pending`.
+//! 2. If its future is dropped, obtain exclusive access to the
+//!    [`Reliable`], serialized with polling.
+//! 3. Call [`Reliable::cancel_pending`] for that operation before abandoning
+//!    it.
+//!
+//! The call wakes each other stored waiter once, and those tasks poll again
+//! and re-register. Only one waiter is stored per operation, so concurrent
+//! futures for the same operation are not tracked separately, and a stale
+//! future must not cancel a newer one. Without the call, the stall remains
+//! possible.
 //!
 //! # Underlying transport requirements
 //!
@@ -200,7 +222,7 @@ mod transport;
 
 pub mod sync;
 
-pub use connection::{Config, Reliable};
+pub use connection::{Config, PendingOperation, Reliable};
 pub use error::{ConfigError, ConnectionError, DecodeError, SeekableError};
 pub use timer::Timer;
 pub use transport::Transport;

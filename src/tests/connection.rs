@@ -17,7 +17,8 @@ use super::support::link::{Endpoint, MockError, Trickle, Wire, is_ack, is_data, 
 use crate::connection::STEP_BUDGET;
 use crate::protocol::{self, ACK_FRAME_LEN};
 use crate::{
-    Config, ConfigError, ConnectionError, Reliable, Timer, Transport, max_encoding_length, sync,
+    Config, ConfigError, ConnectionError, PendingOperation, Reliable, Timer, Transport,
+    max_encoding_length, sync,
 };
 
 const SESSION: u64 = 0x0123_4567_89AB_CDEF;
@@ -1236,4 +1237,227 @@ fn acknowledgments_never_interleave_with_a_trickled_frame() {
     }
     assert_eq!(trickle.written(), expected);
     assert!(expected.len() > 2 * N);
+}
+
+#[test]
+fn cancellation_without_the_handoff_leaves_the_reader_unwoken() {
+    let (mut a, ea, _) = solo(RETRIES);
+    let (r_flag, r) = Flag::new();
+    let (p_flag, p) = Flag::new();
+    let mut buf = [0u8; 8];
+    assert!(a.poll_read(&mut cx_of(&r), &mut buf).is_pending());
+    assert!(a.poll_progress(&mut cx_of(&p)).is_pending());
+    ea.inject_incoming(&data_wire(SESSION, 0, &[1, 2, 3]));
+    assert_eq!((r_flag.count(), p_flag.count()), (0, 1));
+}
+
+#[test]
+fn cancellation_hands_the_reader_a_fresh_registration() {
+    let (mut a, ea, _) = solo(RETRIES);
+    let (r_flag, r) = Flag::new();
+    let (p_flag, p) = Flag::new();
+    let mut buf = [0u8; 8];
+    assert!(a.poll_read(&mut cx_of(&r), &mut buf).is_pending());
+    assert!(a.poll_progress(&mut cx_of(&p)).is_pending());
+    a.cancel_pending(PendingOperation::Progress);
+    assert_eq!((r_flag.count(), p_flag.count()), (1, 0));
+    assert!(a.poll_read(&mut cx_of(&r), &mut buf).is_pending());
+    ea.inject_incoming(&data_wire(SESSION, 0, &[1, 2, 3]));
+    assert_eq!((r_flag.count(), p_flag.count()), (2, 0));
+    assert!(matches!(
+        a.poll_read(&mut cx_of(&r), &mut buf),
+        Poll::Ready(Ok(3))
+    ));
+    assert_eq!(&buf[..3], &[1, 2, 3]);
+    assert_eq!(p_flag.count(), 0);
+}
+
+#[test]
+fn cancellation_lets_surviving_writer_and_flusher_complete() {
+    let (ea, _eb) = link();
+    let clock = FakeClock::latest_waker_only();
+    let mut a: Conn = Reliable::new(ea.clone(), clock, config(SESSION)).unwrap();
+    let (w_flag, w) = Flag::new();
+    let (f_flag, f) = Flag::new();
+    let (p_flag, p) = Flag::new();
+    assert!(matches!(write(&mut a, &[1]), Poll::Ready(Ok(1))));
+    assert!(a.poll_write(&mut cx_of(&w), &[2]).is_pending());
+    assert!(a.poll_flush(&mut cx_of(&f)).is_pending());
+    assert!(a.poll_progress(&mut cx_of(&p)).is_pending());
+    a.cancel_pending(PendingOperation::Progress);
+    assert_eq!((w_flag.count(), f_flag.count(), p_flag.count()), (1, 1, 0));
+    assert!(a.poll_write(&mut cx_of(&w), &[2]).is_pending());
+    assert!(a.poll_flush(&mut cx_of(&f)).is_pending());
+    ea.inject_incoming(&ack_wire(SESSION, 0));
+    assert_eq!((w_flag.count(), f_flag.count(), p_flag.count()), (1, 2, 0));
+    assert!(matches!(a.poll_flush(&mut cx_of(&f)), Poll::Ready(Ok(()))));
+    assert_eq!(w_flag.count(), 2);
+    assert!(matches!(
+        a.poll_write(&mut cx_of(&w), &[2]),
+        Poll::Ready(Ok(1))
+    ));
+    assert_eq!(p_flag.count(), 0);
+}
+
+#[test]
+fn cancellation_lets_the_flusher_reclaim_the_timer_registration() {
+    let (ea, _eb) = link();
+    let clock = FakeClock::latest_waker_only();
+    let mut a: Conn = Reliable::new(
+        ea.clone(),
+        clock.clone(),
+        Config {
+            max_retries: 1,
+            ..config(SESSION)
+        },
+    )
+    .unwrap();
+    let (f_flag, f) = Flag::new();
+    let (p_flag, p) = Flag::new();
+    assert!(matches!(write(&mut a, &[1]), Poll::Ready(Ok(1))));
+    assert!(a.poll_flush(&mut cx_of(&f)).is_pending());
+    assert!(a.poll_progress(&mut cx_of(&p)).is_pending());
+    a.cancel_pending(PendingOperation::Progress);
+    assert_eq!((f_flag.count(), p_flag.count()), (1, 0));
+    assert!(a.poll_flush(&mut cx_of(&f)).is_pending());
+    clock.advance(RTO);
+    assert_eq!((f_flag.count(), p_flag.count()), (2, 0));
+    assert!(a.poll_flush(&mut cx_of(&f)).is_pending());
+    assert_eq!(data_frames(&ea), 2);
+    clock.advance(RTO);
+    assert_eq!((f_flag.count(), p_flag.count()), (3, 0));
+    assert!(matches!(
+        a.poll_flush(&mut cx_of(&f)),
+        Poll::Ready(Err(ConnectionError::Timeout))
+    ));
+}
+
+#[test]
+fn cancellation_resumes_blocked_output_without_loss_or_repeat() {
+    let (mut a, ea, _) = solo(RETRIES);
+    let (f_flag, f) = Flag::new();
+    let (p_flag, p) = Flag::new();
+    let payload = pattern(Conn::MAX_PAYLOAD);
+    ea.limit_writes(Some(5));
+    assert!(matches!(
+        write(&mut a, &payload),
+        Poll::Ready(Ok(len)) if len == payload.len()
+    ));
+    assert!(a.poll_flush(&mut cx_of(&f)).is_pending());
+    assert!(a.poll_progress(&mut cx_of(&p)).is_pending());
+    a.cancel_pending(PendingOperation::Progress);
+    assert_eq!((f_flag.count(), p_flag.count()), (1, 0));
+    assert!(a.poll_flush(&mut cx_of(&f)).is_pending());
+    ea.limit_writes(None);
+    assert_eq!((f_flag.count(), p_flag.count()), (2, 0));
+    assert!(a.poll_flush(&mut cx_of(&f)).is_pending());
+    let sent = ea.written_frames();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        parse_wire(&sent[0]),
+        Some(Wire::Data {
+            session: SESSION,
+            seq: 0,
+            payload,
+        })
+    );
+    ea.inject_incoming(&ack_wire(SESSION, 0));
+    assert!(matches!(a.poll_flush(&mut cx_of(&f)), Poll::Ready(Ok(()))));
+    assert_eq!(data_frames(&ea), 1);
+}
+
+#[test]
+fn cancellation_without_stored_waiters_does_nothing() {
+    let (mut a, ea, _) = solo(RETRIES);
+    for operation in [
+        PendingOperation::Read,
+        PendingOperation::Write,
+        PendingOperation::Flush,
+        PendingOperation::Progress,
+    ] {
+        a.cancel_pending(operation);
+    }
+    let (flag, waker) = Flag::new();
+    let mut buf = [0u8; 8];
+    assert!(a.poll_progress(&mut cx_of(&waker)).is_pending());
+    assert!(a.poll_read(&mut cx_of(&waker), &mut buf).is_pending());
+    assert_eq!(flag.count(), 0);
+    assert!(ea.written_frames().is_empty());
+}
+
+#[test]
+fn cancellation_clears_the_canceled_waker() {
+    let (mut a, ea, _) = solo(RETRIES);
+    let (r_flag, r) = Flag::new();
+    let (p_flag, p) = Flag::new();
+    let mut buf = [0u8; 8];
+    assert!(a.poll_read(&mut cx_of(&r), &mut buf).is_pending());
+    assert!(a.poll_progress(&mut cx_of(&p)).is_pending());
+    a.cancel_pending(PendingOperation::Read);
+    assert_eq!((r_flag.count(), p_flag.count()), (0, 1));
+    ea.inject_incoming(&data_wire(SESSION, 0, &[1]));
+    assert!(a.poll_progress(&mut cx_of(&p)).is_pending());
+    a.cancel_pending(PendingOperation::Write);
+    assert_eq!(r_flag.count(), 0);
+    assert!(matches!(
+        a.poll_read(&mut cx_of(&r), &mut buf),
+        Poll::Ready(Ok(1))
+    ));
+}
+
+#[test]
+fn cancellation_wakes_each_waiter_once() {
+    let (mut a, _ea, _) = solo(RETRIES);
+    let (r_flag, r) = Flag::new();
+    let (f_flag, f) = Flag::new();
+    let (p_flag, p) = Flag::new();
+    let mut buf = [0u8; 8];
+    assert!(matches!(write(&mut a, &[1]), Poll::Ready(Ok(1))));
+    assert!(a.poll_read(&mut cx_of(&r), &mut buf).is_pending());
+    assert!(a.poll_flush(&mut cx_of(&f)).is_pending());
+    assert!(a.poll_progress(&mut cx_of(&p)).is_pending());
+    a.cancel_pending(PendingOperation::Progress);
+    a.cancel_pending(PendingOperation::Progress);
+    a.cancel_pending(PendingOperation::Write);
+    assert_eq!((r_flag.count(), f_flag.count(), p_flag.count()), (1, 1, 0));
+    assert!(a.poll_read(&mut cx_of(&r), &mut buf).is_pending());
+    a.cancel_pending(PendingOperation::Flush);
+    assert_eq!((r_flag.count(), f_flag.count(), p_flag.count()), (2, 1, 0));
+}
+
+#[test]
+fn cancellation_keeps_protocol_state() {
+    let (mut a, ea, clock) = solo(1);
+    let (_, w) = Flag::new();
+    let mut buf = [0u8; 8];
+    assert!(matches!(write(&mut a, &[1, 2, 3]), Poll::Ready(Ok(3))));
+    ea.inject_incoming(&data_wire(SESSION, 0, &[7, 8]));
+    ea.limit_writes(Some(0));
+    assert!(progress(&mut a).is_pending());
+    assert!(a.poll_flush(&mut cx_of(&w)).is_pending());
+    let cancel_all = |a: &mut Conn| {
+        for operation in [
+            PendingOperation::Read,
+            PendingOperation::Write,
+            PendingOperation::Flush,
+            PendingOperation::Progress,
+        ] {
+            a.cancel_pending(operation);
+        }
+    };
+    cancel_all(&mut a);
+    clock.advance(RTO);
+    ea.limit_writes(None);
+    assert!(progress(&mut a).is_pending());
+    assert_eq!(data_frames(&ea), 2);
+    let sent = ea.written_frames();
+    assert_eq!(count(&sent, |w| matches!(w, Wire::Ack { seq: 0, .. })), 1);
+    cancel_all(&mut a);
+    assert!(matches!(read(&mut a, &mut buf), Poll::Ready(Ok(2))));
+    assert_eq!(&buf[..2], &[7, 8]);
+    clock.advance(RTO);
+    assert!(matches!(
+        progress(&mut a),
+        Poll::Ready(ConnectionError::Timeout)
+    ));
 }

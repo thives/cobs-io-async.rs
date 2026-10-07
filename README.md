@@ -98,13 +98,30 @@ terminated the connection.
 | Corrupted or malformed frame | Discarded; retransmission recovers. |
 | Receive slot full | New data is not acknowledged, so the peer retransmits it. |
 | Transport error, EOF, exhausted retries or sequence numbers | The connection fails permanently with a `ConnectionError`. |
-| Dropped future | Harmless; all state is owned by the connection. |
+| Dropped future | Protocol state and accepted data are unaffected. Multi-task adapters must call `Reliable::cancel_pending` to preserve the other operations' wakeups. |
 
 The underlying transport must report end of stream as `Ok(0)` from
 `poll_read` with a nonempty buffer, and temporary lack of input as `Pending`.
 
 Each poll method does a bounded amount of work, and wakes the task itself if
 work remains, so an always-ready transport cannot monopolize an executor.
+
+### Cancellation
+
+Dropping a future never rolls back protocol state or corrupts accepted data,
+but the connection cannot detect the drop. The underlying transport and timer
+wake only their latest poller, so canceling it can leave another pending task
+without a wakeup. An adapter that polls operations from separate tasks must,
+when it drops a pending future:
+
+1. obtain exclusive access to the `Reliable`, serialized with polling;
+2. call `Reliable::cancel_pending` with the `PendingOperation` that returned
+   `Pending`, before abandoning it.
+
+This clears that operation's waiter and wakes each other stored waiter once;
+those tasks poll again and re-register. The connection stores one waiter per
+operation, so an old canceled future must not cancel a newer one for the same
+operation. Without the call, the stall remains possible.
 
 ### Capacity
 

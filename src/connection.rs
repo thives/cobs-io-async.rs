@@ -95,6 +95,23 @@ impl Budget {
     }
 }
 
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+/// An operation of a [`Reliable`] connection that can be pending.
+///
+/// Identifies the operation abandoned in
+/// [`Reliable::cancel_pending`]. The connection stores one waiter per
+/// operation.
+pub enum PendingOperation {
+    /// [`Transport::poll_read`].
+    Read,
+    /// [`Transport::poll_write`].
+    Write,
+    /// [`Transport::poll_flush`].
+    Flush,
+    /// [`Reliable::poll_progress`].
+    Progress,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Op {
     Read,
@@ -163,6 +180,17 @@ enum Health<E> {
 /// deadline and starts retransmissions. Call
 /// [`poll_progress`](Self::poll_progress) when no read, write or flush is
 /// outstanding.
+///
+/// # Cancellation
+///
+/// Dropping a future that awaits a poll method rolls back no protocol state
+/// and corrupts no accepted data. It does not, however, notify the
+/// connection. When tasks poll the operations separately, the transport and
+/// timer wake only the task that polled them last, so dropping that future
+/// can leave the others without a wakeup. An adapter that supports canceling
+/// pending operations must call
+/// [`cancel_pending`](Self::cancel_pending) for the dropped operation. The
+/// connection does not detect dropped futures.
 ///
 /// # Failure
 ///
@@ -271,6 +299,46 @@ impl<T: Transport, C: Timer, const N: usize> Reliable<T, C, N> {
             None => Poll::Pending,
         };
         self.finish(Op::Progress, cx, poll)
+    }
+
+    /// Abandons a pending `operation` and hands its wakeups to the others.
+    ///
+    /// The underlying [`Transport`] and [`Timer`] remember only the waker of
+    /// their latest poller. If that poller is dropped while pending, the
+    /// registration is lost and the connection cannot detect it, so the
+    /// surviving operations may never be woken. This method clears the stored
+    /// waiter of `operation` and wakes and removes every other stored waiter.
+    /// Each woken task polls again and re-registers with the transport and
+    /// timer.
+    ///
+    /// Protocol state is unchanged: an accepted packet, a partially written
+    /// frame, retained incoming payload, pending acknowledgments and
+    /// retransmission deadlines and retry counts all survive. Nothing is
+    /// sent, and no task is woken if no waiter is stored. Waiters are woken
+    /// once per call, so calling it repeatedly does not wake a task again
+    /// until it has polled and registered again.
+    ///
+    /// # Serialization
+    ///
+    /// Call it with exclusive access to the connection, after the last poll
+    /// of the abandoned operation and before the operation is forgotten. The
+    /// connection stores one waiter per operation, and does not distinguish
+    /// between futures awaiting the same one. Canceling an older future of an
+    /// operation while a newer one is pending clears the newer one's waiter,
+    /// so the adapter must prevent that or track the futures itself.
+    pub fn cancel_pending(&mut self, operation: PendingOperation) {
+        let canceled = match operation {
+            PendingOperation::Read => Op::Read,
+            PendingOperation::Write => Op::Write,
+            PendingOperation::Flush => Op::Flush,
+            PendingOperation::Progress => Op::Progress,
+        };
+        self.waiters.clear(canceled);
+        for op in OPS {
+            if op != canceled {
+                self.waiters.wake(op);
+            }
+        }
     }
 
     #[cfg(test)]
